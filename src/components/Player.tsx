@@ -41,19 +41,28 @@ export default function Player({
   const [rate, setRate] = useState(1);
   const [errMsg, setErrMsg] = useState<string>("");
   const [controlsLocked, setControlsLocked] = useState(false);
+  /* 换源/重连后重新套用倍速：媒体资源切换会把 playbackRate 重置为 1，
+     不套回去就会出现「按钮显示 2x，实际 1x」。 */
+  const rateRef = useRef(rate);
+  rateRef.current = rate;
   const seek = useSeekInput({ time, duration, enabled: active && !controlsLocked, resetKey: src,
     onInteraction: (phase, input, target, pointerTarget) => trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget }),
     onSeek: (target, input) => {
       const video = videoRef.current;
       if (!video || !activity.isActive()) return;
-      requestSeek(target, `legacy_${input}`);
+      /* 收敛到片尾之内：currentTime 恰好等于 duration 会抛 InvalidStateError 或卡在最后一片 */
+      const dur = video.duration && Number.isFinite(video.duration) ? video.duration : 0;
+      const t = dur > 0 ? Math.max(0, Math.min(dur - 0.15, target)) : Math.max(0, target);
+      requestSeek(t, `legacy_${input}`);
       setWaiting(true);
       if (hlsRef.current) {
-        try { hlsRef.current.startLoad(target); } catch { /* ignore */ }
+        try { hlsRef.current.startLoad(t); } catch { /* ignore */ }
       }
-      video.currentTime = target;
-      trace("seek.assigned", { target });
-      setTime(video.currentTime);
+      try {
+        video.currentTime = t;
+        trace("seek.assigned", { target: t });
+      } catch { /* 极端情况下浏览器拒绝赋值，保持原位置 */ }
+      setTime(t);
     },
   });
 
@@ -63,6 +72,8 @@ export default function Player({
     const url = playlist(src);
     recoverCountRef.current = 0;
     setErrMsg("");
+    setTime(0);
+    setDuration(0);
     trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
 
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
@@ -94,6 +105,7 @@ export default function Player({
       observeHls(hls, trace);
       hls.loadSource(url);
       hls.attachMedia(video);
+      video.playbackRate = rateRef.current;   // attach 会把倍速重置成 1
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (activity.isActive()) hls.startLoad();
         if (autoPlay) activity.play("manifest_autoplay", true);
@@ -126,9 +138,9 @@ export default function Player({
         const detail = `${data.type}/${data.details}/${data.response?.code ?? ""}/${String(data.reason ?? "").slice(0, 80)}`;
         (window as unknown as { __hlsErr?: string }).__hlsErr = detail;
         setErrMsg(detail);
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else { hls.destroy(); hlsRef.current = null; }
+        /* 已经试过 4 次自动恢复：不再无退避地重连，停掉加载等用户操作（拖动进度条会重新 startLoad），
+           否则离线/源站 5xx 时会对着同一个地址无限打请求。 */
+        try { hls.stopLoad(); } catch { /* ignore */ }
       });
     } else {
       // Safari / 部分 WebView 原生支持 HLS
@@ -198,7 +210,11 @@ export default function Player({
         onPlaying={() => { if (activity.isActive()) { setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
         onSeeked={() => setWaiting(false)}
         onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
-        onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration || 0)}
+        onLoadedMetadata={(e) => {
+          const v = e.target as HTMLVideoElement;
+          v.playbackRate = rateRef.current;
+          setDuration(v.duration || 0);
+        }}
         onEnded={() => { if (activity.isActive()) onEnded?.(); }}
       />
 

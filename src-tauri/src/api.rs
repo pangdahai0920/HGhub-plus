@@ -415,6 +415,20 @@ pub async fn api_feed(state: State<'_, Api>, page: u32, size: u32) -> Result<Val
         .await
 }
 
+/// 分类名会拼进请求路径：禁止路径/查询分隔符与 `..`，避免 `../account/me` 逃逸到别的接口
+/// 或 `?x=1` 注入查询串（中文分类名照常放行，由 URL 解析时统一百分号编码）。
+fn safe_cate(raw: &str) -> Result<&str, String> {
+    let s = raw.trim();
+    let bad = s.is_empty()
+        || s.len() > 64
+        || s.contains("..")
+        || s.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | '?' | '#' | '%'));
+    if bad {
+        return Err("分类名不合法".into());
+    }
+    Ok(s)
+}
+
 #[tauri::command]
 pub async fn api_category(
     state: State<'_, Api>,
@@ -422,6 +436,7 @@ pub async fn api_category(
     page: u32,
     size: u32,
 ) -> Result<Value, String> {
+    let cate = safe_cate(&cate)?;
     state
         .get(&format!(
             "/api/videos/category/{cate}?page={page}&size={size}"
@@ -626,7 +641,7 @@ pub async fn api_post_comments(
 }
 #[cfg(test)]
 mod tests {
-    use super::{has_play_url, is_newer, normalize_play_info};
+    use super::{has_play_url, is_newer, normalize_play_info, safe_cate};
     use serde_json::{json, Value};
 
     #[test]
@@ -700,5 +715,15 @@ mod tests {
         assert!(!is_newer("v1.0.1", "1.0.1"));
         assert!(!is_newer("v0.9.9", "1.0.1"));
         assert!(!is_newer("", "1.0.1"));
+    }
+
+    #[test]
+    fn category_name_cannot_escape_the_path() {
+        assert_eq!(safe_cate("都市").unwrap(), "都市");
+        assert_eq!(safe_cate("urban-life_2").unwrap(), "urban-life_2");
+        for raw in ["", "  ", "../account/me", "a/../../b", "x?d=1", "a#b", "a%2e%2e/b", "a\\b", "a\nb"] {
+            assert!(safe_cate(raw).is_err(), "应拒绝分类名 {raw:?}");
+        }
+        assert!(safe_cate(&"走".repeat(33)).is_err(), "超长分类名应拒绝");
     }
 }

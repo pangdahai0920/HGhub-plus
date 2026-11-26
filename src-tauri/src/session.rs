@@ -47,6 +47,28 @@ mod tests {
         assert_eq!(store.token("https://huangguoai.com"), None);
         assert!(store.user("https://huangguoai.com").is_null());
     }
+
+    #[test]
+    fn session_is_persisted_atomically() {
+        let dir = std::env::temp_dir().join(format!("hghub-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = SessionStore::new();
+        store.bind(dir.clone());
+        store.set("https://a.example", "t1".into(), json!({"id": 1}));
+
+        let file = dir.join("session.json");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("t1"));
+        assert!(!dir.join("session.json.tmp").exists(), "临时文件必须被 rename 掉");
+
+        // 重新绑定后能读回，说明落盘的是完整 JSON
+        let again = SessionStore::new();
+        again.bind(dir.clone());
+        assert_eq!(again.token("https://a.example").as_deref(), Some("t1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 pub struct SessionStore {
@@ -109,10 +131,36 @@ impl SessionStore {
 
     fn persist(&self) {
         let snapshot = self.current.lock().unwrap().clone();
-        if let Some(path) = self.file.lock().unwrap().as_ref() {
+        let path = self.file.lock().unwrap().clone();
+        if let Some(path) = path {
             if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
-                let _ = std::fs::write(path, text);
+                write_atomic(&path, text.as_bytes());
             }
         }
     }
 }
+
+/// 先写临时文件再原子替换：直接 `fs::write` 中途崩溃/磁盘满会留下半截 session.json，
+/// 下次启动解析失败就表现为「随机掉登录」，而且旧会话也一起丢了。
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    restrict_permissions(path);
+}
+
+/// token 等价于账号凭据：Unix 下把文件收紧到仅本人可读写（Windows 由用户配置目录的 ACL 保证）。
+#[cfg(unix)]
+fn restrict_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &std::path::Path) {}

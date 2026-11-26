@@ -298,15 +298,17 @@ pub fn clear_caches() {
 
 /* ───────────────────────── 协议响应 ───────────────────────── */
 
+/// 注意：这里不声明 `Accept-Ranges`。handle() 并不处理 Range 请求（永远返回 200 全量 body），
+/// 声明支持字节区间会让 <video>/播放器发起 Range 请求后拿到 200，mp4 拖动与 fMP4 的
+/// EXT-X-BYTERANGE 都会因此失效或反复重下；不声明反而会按整段下载正常播放。
 fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec<u8>> {
     let len = body.len().to_string();
     Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header("Content-Type", ctype)
         .header("Content-Length", len)
-        .header("Accept-Ranges", "bytes")
         .header("X-Content-Type-Options", "nosniff")
-        .header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Accept-Ranges")
+        .header("Access-Control-Expose-Headers", "Content-Length, Content-Type")
         .header("Cache-Control", cache)
         .body(body)
         .unwrap_or_else(|_| Response::new(Vec::new()))

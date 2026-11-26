@@ -59,6 +59,13 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   const recoverCountRef = useRef(0);
   const recoverTimerRef = useRef<number | null>(null);
   const lastSizeRef = useRef({ w: 0, h: 0 });
+  /* seek 后的「就绪即播」兜底定时器：换源/卸载时必须清掉，
+     否则会对着已经切走的 <video> 再 play() 一次，把用户刚暂停的下一集顶起来。 */
+  const seekResumeTimers = useRef<number[]>([]);
+  const clearSeekResume = () => {
+    seekResumeTimers.current.forEach((id) => window.clearTimeout(id));
+    seekResumeTimers.current = [];
+  };
   const [ready, setReady] = useState(false);
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { ...diagnosticContext, active, resource: mediaResource(src) });
   const activity = usePlaybackActivity(videoRef, hlsRef, { active, autoPlay, src, trace });
@@ -106,14 +113,16 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       };
       v.addEventListener("seeked", resumeOnce, { once: true });
       v.addEventListener("canplay", resumeOnce, { once: true });
-      // 兜底：若 350ms 内已经就绪则直接播
-      window.setTimeout(() => {
+      // 兜底：若 350ms 内已经就绪则直接播（换源/卸载时会清掉）
+      const tid = window.setTimeout(() => {
+        seekResumeTimers.current = seekResumeTimers.current.filter((id) => id !== tid);
         if (v.readyState >= 2 && v.paused && activity.isActive()) {
           v.removeEventListener("seeked", resumeOnce);
           v.removeEventListener("canplay", resumeOnce);
           v.play().catch(() => {});
         }
       }, 350);
+      seekResumeTimers.current.push(tid);
     }
   };
 
@@ -157,6 +166,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     if (!video || !src) return;
     setReady(false);
     recoverCountRef.current = 0;
+    clearSeekResume();
     lastSizeRef.current = { w: 0, h: 0 };
     if (recoverTimerRef.current) {
       window.clearTimeout(recoverTimerRef.current);
@@ -281,6 +291,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
     return () => {
       trace("source.cleanup");
+      clearSeekResume();
       if (recoverTimerRef.current) {
         window.clearTimeout(recoverTimerRef.current);
         recoverTimerRef.current = null;
@@ -289,6 +300,9 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
+
+  /* 卸载时把兜底定时器一并清掉 */
+  useEffect(() => clearSeekResume, []);
 
   useEffect(() => { if (videoRef.current) videoRef.current.muted = muted; }, [muted]);
   useEffect(() => { if (videoRef.current) videoRef.current.volume = volume; }, [volume]);

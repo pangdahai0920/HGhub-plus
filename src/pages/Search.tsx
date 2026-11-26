@@ -19,18 +19,23 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
   const [err, setErr] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const busy = useRef(false);
+  /* 请求序号：换关键词时允许打断在途请求，旧响应回来直接丢弃，
+     否则「先搜都市再搜逆袭」会把都市的结果写进逆袭的列表里。 */
+  const reqSeq = useRef(0);
 
   useEffect(() => {
     if (active && !/Android/i.test(navigator.userAgent)) inputRef.current?.focus();
   }, [active]);
 
   const run = async (keyword: string, p: number) => {
-    if (busy.current) return;
+    if (p > 1 && busy.current) return;      // 只挡同一次搜索的重复翻页
     if (p > pages && p > 1) return;
+    const seq = ++reqSeq.current;
     busy.current = true;
     setLoading(true);
     try {
       const res = await api.search(keyword, p, 20);
+      if (seq !== reqSeq.current) return;
       setItems((prev) => {
         const base = p === 1 ? [] : prev;
         const seen = new Set(base.map((x) => x.id));
@@ -40,10 +45,9 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
       setPages(res?.pagination?.pages || 1);
       setErr(null);
     } catch (e) {
-      setErr((e as Error).message || "搜索失败");
+      if (seq === reqSeq.current) setErr((e as Error).message || "搜索失败");
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (seq === reqSeq.current) { busy.current = false; setLoading(false); }
     }
   };
 

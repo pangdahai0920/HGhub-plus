@@ -147,11 +147,15 @@ export function Img({ src, alt = "", className = "", eager = false, raw = false 
   const [ok, setOk] = useState(false);
   const [err, setErr] = useState(false);
   const url = raw ? src : cover(src);
+  /* 地址变了要重置状态：同一个 <img> 从占位（空地址）换成真封面时，
+     若沿用上一次的 err，就会一直是灰块，封面永远出不来。 */
+  useEffect(() => { setOk(false); setErr(false); }, [url]);
+  if (!url) return <div className={`absolute inset-0 overflow-hidden bg-s3 ${className}`} />;
   return (
     <div className={`absolute inset-0 overflow-hidden ${className}`}>
       {!ok && !err && <div className="absolute inset-0 shimmer" />}
       {err && <div className="absolute inset-0 bg-s3" />}
-      <img src={url} alt={alt} loading={eager ? "eager" : "lazy"} onLoad={() => setOk(true)} onError={() => setErr(true)}
+      <img key={url} src={url} alt={alt} loading={eager ? "eager" : "lazy"} onLoad={() => setOk(true)} onError={() => setErr(true)}
         className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${ok ? "opacity-100" : "opacity-0"}`} draggable={false} />
     </div>
   );

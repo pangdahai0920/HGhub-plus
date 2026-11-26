@@ -59,13 +59,17 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  /* 请求序号：切集/切剧时旧响应回来直接丢弃，避免第 1 集的评论追加到第 2 集里 */
+  const reqSeq = useRef(0);
 
   const load = async (p: number) => {
+    const seq = ++reqSeq.current;
     setLoading(true);
     try {
       const res: CommentPage | null = kind === "post"
         ? await api.postComments(videoId, p, 20)
         : await api.comments(videoId, ep, p, 20);
+      if (seq !== reqSeq.current) return;
       setItems((prev) => {
         const base = p === 1 ? [] : prev;
         const seen = new Set(base.map((x) => x.id));
@@ -74,9 +78,9 @@ export function CommentsPanel({ videoId, ep, total, kind = "video", onClose }: {
       setPage(p);
       setPages(res?.pagination?.pages || 1);
     } catch {
-      if (p === 1) setItems([]);
+      if (seq === reqSeq.current && p === 1) setItems([]);
     } finally {
-      setLoading(false);
+      if (seq === reqSeq.current) setLoading(false);
     }
   };
 

@@ -77,6 +77,12 @@ function normalizeHistory(raw: unknown): WatchProgress[] {
   return out;
 }
 
+/** 存档里的数组/数字可能被旧版本或半截写入弄坏：逐字段校验，坏值回退默认，避免渲染期 TypeError 白屏 */
+const numList = (raw: unknown): number[] =>
+  Array.isArray(raw) ? raw.filter((x): x is number => typeof x === "number" && Number.isFinite(x)) : [];
+const strList = (raw: unknown): string[] =>
+  Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string" && x.length > 0) : [];
+
 function loadPersist(): Persist {
   try {
     const raw = localStorage.getItem(LS);
@@ -84,7 +90,18 @@ function loadPersist(): Persist {
     const p = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Persist>) };
     // 只在启动时应用；本次使用中取消静音不会关闭此偏好。
     const muteOnStartup = p.muteOnStartup !== false;
-    return { ...p, muteOnStartup, muted: muteOnStartup || p.muted === true, history: normalizeHistory(p.history) };
+    const volume = Number.isFinite(p.volume) ? Math.max(0, Math.min(1, Number(p.volume))) : DEFAULTS.volume;
+    return {
+      ...p,
+      likes: numList(p.likes),
+      favs: numList(p.favs),
+      follows: numList(p.follows),
+      searchHist: strList(p.searchHist).slice(0, 12),
+      history: normalizeHistory(p.history).slice(0, 80),
+      volume,
+      muteOnStartup,
+      muted: muteOnStartup || p.muted === true,
+    };
   } catch {
     return DEFAULTS;
   }

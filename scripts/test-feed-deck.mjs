@@ -38,6 +38,9 @@ function browserPath() {
   return undefined;
 }
 
+/** 1x1 透明 PNG：用来验证封面渲染链路（本地解密协议在浏览器里不存在，route 拦下来回它） */
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==", "base64");
+
 const MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36";
 const SHORT = [{ id: 101, title: "剧A", eps: 5 }, { id: 102, title: "剧B", eps: 3 }, { id: 103, title: "剧C", eps: 4 }];
 const LONG = [{ id: 201, title: "长剧", eps: 120 }, { id: 202, title: "短剧", eps: 2 }];
@@ -49,12 +52,13 @@ const report = { started: new Date().toISOString(), cases: [], failures: [] };
 /* ── Tauri IPC 桩 ─────────────────────────────────────────── */
 function stub({ videos }) {
   let seq = 0;
+  const coverOf = (v) => `https://img.invalid/${v.id}.jpg`;
   const card = (v) => ({
-    id: v.id, title: v.title, cover: "", tags: [], score: 0, episode_count: v.eps, total_episodes: v.eps,
+    id: v.id, title: v.title, cover: coverOf(v), tags: [], score: 0, episode_count: v.eps, total_episodes: v.eps,
     hot: 0, like_count: 0, collect_count: 0, comment_count: 0, is_finished: false, is_original: 1,
   });
   const detail = (v) => ({
-    id: v.id, title: v.title, description: `${v.title} 简介`, cover: "", tags: [], tag_links: [], score: 8.5,
+    id: v.id, title: v.title, description: `${v.title} 简介`, cover: coverOf(v), tags: [], tag_links: [], score: 8.5,
     episode_count: v.eps, total_episodes: v.eps,
     episodes: Array.from({ length: v.eps }, (_, i) => ({ ep_num: i + 1, title: `第${i + 1}集`, duration: 90, status: 1 })),
     counts: { collect: 0, comment: 0, hot: 0, like: 0 }, author: { id: v.id * 10, name: `作者${v.id}` },
@@ -70,7 +74,12 @@ function stub({ videos }) {
       if (cmd === "api_feed" || cmd === "api_category" || cmd === "api_search") {
         return { items: videos.map(card), pagination: { page: 1, pages: 1, size: 10, total: videos.length } };
       }
-      if (cmd === "api_video") { const v = videos.find((x) => x.id === Number(a?.id)); return v ? detail(v) : null; }
+      if (cmd === "api_video") {
+        const v = videos.find((x) => x.id === Number(a?.id));
+        if (!v) return null;
+        if (v.detailDelayMs) await new Promise((r) => setTimeout(r, v.detailDelayMs));
+        return detail(v);
+      }
       // 给个不会真的取到流的地址：播放器结构照常渲染（全屏/控制条才有东西可点），只是画面报错
       if (cmd === "api_play") return { id: Number(a?.id), ep_num: Number(a?.ep), duration: 90, title: "", video_url: "https://media.fixture.invalid/v.m3u8" };
       if (cmd === "api_comments" || cmd === "api_post_comments") return { ep: 1, items: [], pagination: { page: 1, pages: 1, size: 20, total: 0 } };
@@ -126,6 +135,10 @@ async function open({ videos = SHORT, mobile = false, storage = null }) {
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e)));
   await page.addInitScript(stub, { videos });
+  /* 本地解密协议在浏览器里不存在：拦下来回一张真图，才能验证封面渲染链路 */
+  await context.route("**/img?**", (route) => route.fulfill({ status: 200, contentType: "image/png", body: PNG }));
+  await context.route("**/hls?**", (route) => route.abort());
+  await context.route("**/seg?**", (route) => route.abort());
   if (storage) await page.addInitScript((s) => localStorage.setItem("hghub_app_v1", s), storage);
   await page.goto(base, { waitUntil: "load" });
   await page.bringToFront();
@@ -139,6 +152,12 @@ try {
     await page.waitForSelector("section[data-video]");
     const first = await waitSlide(page, 101, 1);
     check("首页进入第 1 集", [first.video, first.ep], [101, 1]);
+    /* 封面：占位空地址 → 真封面之后必须能显示（Img 的 ok/err 要随地址重置，否则一直是灰块） */
+    await page.waitForFunction(() => {
+      const img = document.querySelector('section[data-video="101"][data-ep="2"] img');
+      return !!img && img.naturalWidth > 0 && Number(getComputedStyle(img).opacity) > 0.9;
+    }, null, { timeout: 8000 });
+    check("非当前屏的封面能正常显示", true, true);
     // 当前剧 + 下一部展开，再下一部还是单屏
     await page.waitForFunction(() => document.querySelectorAll(".no-bar section").length >= 9);
     check("展开后滑片数 = 5 + 3 + 1", (await activeOf(page)).total, 9);
@@ -242,6 +261,30 @@ try {
     check("远跳后下滑 = 第 99 集", (await waitSlide(page, 201, 99)).ep, 99);
     await page.screenshot({ path: join(output, "long.png") });
     check("长剧页无脚本错误", errors, []);
+    await context.close();
+  }
+
+  /* 4.5 详情晚到：先在空封面上停留，详情回来封面要补上（Img 状态随地址重置） */
+  {
+    const slow = [{ id: 301, title: "剧D", eps: 2 }, { id: 302, title: "剧E", eps: 2, detailDelayMs: 2500 }];
+    const { page, context, errors } = await open({ videos: slow });
+    await page.waitForSelector("section[data-video]");
+    await waitSlide(page, 301, 1);
+    await page.keyboard.press("ArrowDown"); await waitSlide(page, 301, 2);
+    await page.keyboard.press("ArrowDown"); await waitSlide(page, 302, 1);
+    const before = await page.evaluate(() => {
+      const img = document.querySelector('section[data-video="302"][data-ep="1"] img');
+      return img ? img.naturalWidth : -1;   // -1 = 还没渲染 img（空地址已被跳过）
+    });
+    check("详情没到时不显示破图", before <= 0, true);
+    await page.waitForFunction(() => {
+      const img = document.querySelector('section[data-video="302"][data-ep="1"] img');
+      return !!img && img.naturalWidth > 0 && Number(getComputedStyle(img).opacity) > 0.9;
+    }, null, { timeout: 10000 });
+    check("封面晚到后能正常显示", true, true);
+    check("剧集晚到后仍停在同一集", (await activeOf(page)).ep, 1);
+    check("详情晚到场景无脚本错误", errors, []);
+    await page.screenshot({ path: join(output, "slow-detail.png") });
     await context.close();
   }
 

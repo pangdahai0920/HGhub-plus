@@ -19,7 +19,9 @@ export default function Profile({ wide }: { wide: boolean }) {
 
   useEffect(() => {
     let alive = true;
-    if (!ids.length) { setCards([]); return; }
+    // 先清掉上一个 tab 的卡片与加载态：否则切到空的收藏页时 loading 会永远停在 true
+    setCards([]);
+    if (!ids.length) { setLoading(false); return; }
     setLoading(true);
     Promise.allSettled(ids.slice(0, 12).map((id) => api.video(id)))
       .then((rs) => {
