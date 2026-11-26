@@ -14,6 +14,7 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const busy = useRef(false);
   const sentinel = useRef<HTMLDivElement>(null);
 
@@ -21,6 +22,7 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
     if (busy.current || page >= pages) return;
     busy.current = true;
     setLoading(true);
+    setError("");
     try {
       const next = page + 1;
       const res = await api.posts(next, 20);
@@ -30,7 +32,10 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
       });
       setPage(next);
       setPages(res?.pagination?.pages || next);
-    } catch { /* ignore */ } finally {
+    } catch (e) {
+      /* 之前完全吞掉：断网时界面显示「暂无内容」，用户看不出是网络问题也没法重试 */
+      setError((e as Error).message || "加载失败");
+    } finally {
       busy.current = false;
       setLoading(false);
     }
@@ -73,6 +78,8 @@ export function PostsPage({ onBack, wide }: { onBack: () => void; wide: boolean 
           </div>
         ) : loading ? (
           <div className="flex justify-center py-12"><div className="w-8 h-8 spinner" /></div>
+        ) : error ? (
+          <Empty icon={<IFireF size={26} />} title="吃瓜内容加载失败" sub={error} action="重试" onAction={() => loadMore()} />
         ) : (
           <Empty icon={<IFireF size={26} />} title="暂无吃瓜内容" sub="稍后再来看看" />
         )}

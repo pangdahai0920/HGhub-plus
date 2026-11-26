@@ -167,10 +167,15 @@ pub async fn check_update() -> Result<Value, String> {
     }))
 }
 
-/// 用系统默认浏览器打开链接（只允许 http/https）。
+/// 用系统默认浏览器打开链接（只允许 http/https，且不能解析到内网）。
 #[tauri::command]
 pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let target = crate::network_policy::parse_target(&url)?;
+    /* 只校验字面量 IP 挡不住 `127.0.0.1.nip.io` / `localtest.me` 这类解析到内网的域名：
+       这里按当前安全模式真的解析一次，再交给系统浏览器 */
+    crate::network_policy::resolve_target(&target, crate::network_policy::strict_security())
+        .await
+        .map_err(|e| format!("链接无法打开：{e}"))?;
     // 固定使用默认处理器；不向前端暴露可指定程序的 opener 命令。
     app.opener()
         .open_url(target.as_str(), None::<&str>)

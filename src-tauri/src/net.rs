@@ -292,9 +292,38 @@ pub fn heal_client(reason: &str) {
     refresh_client();
 }
 
-/// reqwest 的 `Display` 只有「error sending request for url (...)」，
-/// 真正的原因（dns error / connection refused / invalid peer certificate）
-/// 藏在 `source()` 链里。展开成一行，界面和 debug.log 才有排查价值。
+/// 错误串里可能内嵌完整 URL（通常带 `auth_key`/`sign` 之类的时效签名）：
+/// 对外返回前把查询串抹掉，只保留 `scheme://host/path?…`。
+pub fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("http") {
+        let (head, tail) = rest.split_at(idx);
+        out.push_str(head);
+        if !(tail.starts_with("http://") || tail.starts_with("https://")) {
+            out.push_str(&tail[..4]);
+            rest = &tail[4..];
+            continue;
+        }
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ')' || c == '"' || c == '\'' || c == ']')
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        match url.find('?') {
+            Some(i) => {
+                out.push_str(&url[..i]);
+                out.push_str("?…");
+            }
+            None => out.push_str(url),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 把 reqwest 的错误链展开成一行（`Display` 只给「error sending request」，
+/// 真正原因藏在 `source()` 里），再按 `redact_urls` 抹掉带签名的查询串。
 pub fn err_text(e: &reqwest::Error) -> String {
     let mut out = e.to_string();
     let mut src = std::error::Error::source(e);
@@ -306,7 +335,7 @@ pub fn err_text(e: &reqwest::Error) -> String {
         }
         src = s.source();
     }
-    out
+    redact_urls(&out)
 }
 
 fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
@@ -817,6 +846,18 @@ mod tests {
         for raw in ["alice:secret@127.0.0.1:7897", "not a url secret", ""] {
             assert_eq!(redact_proxy(raw), "[已配置，原始值已隐藏]");
         }
+    }
+
+    #[test]
+    fn error_text_never_carries_signed_query_strings() {
+        let raw = "error sending request for url (https://cdn.example/seg/a.ts?auth_key=9999-0-0-deadbeef) ← connection reset";
+        let out = redact_urls(raw);
+        assert!(!out.contains("deadbeef"), "签名字段必须被抹掉：{out}");
+        assert!(out.contains("https://cdn.example/seg/a.ts"));
+        assert!(out.ends_with("connection reset"), "其余诊断信息要保留：{out}");
+        // 没有查询串的 URL 原样保留；URL 之外的文本不动
+        assert_eq!(redact_urls("see https://a.example/x"), "see https://a.example/x");
+        assert_eq!(redact_urls("no links here"), "no links here");
     }
 
     #[test]

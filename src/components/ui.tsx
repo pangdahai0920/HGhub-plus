@@ -134,7 +134,7 @@ export function useLongPress(cb: (e: { clientX: number; clientY: number }) => vo
 /* ——— 关闭按钮 ——— */
 export function CloseBtn({ onClick }: { onClick: () => void }) {
   return (
-    <button onClick={onClick} className="w-8 h-8 rounded-full bg-s3/80 flex items-center justify-center text-mut pressable hover:text-on">
+    <button onClick={onClick} aria-label="关闭" className="w-8 h-8 rounded-full bg-s3/80 flex items-center justify-center text-mut pressable hover:text-on">
       <IClose size={16} />
     </button>
   );

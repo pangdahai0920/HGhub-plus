@@ -27,33 +27,77 @@ pub const LOCAL_ORIGIN: &str = "hg://localhost";
 const IMG_KEY: &[u8] = b"f5d965df75336270";
 const IMG_IV: &[u8] = b"97b60394abc2fbe1";
 
-static IMG_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// 带访问序号的缓存：满了淘汰「最久没用过」的那条。
+/// 原来用 `m.keys().next()` 随机淘汰，正在播的那一集的分片可能被一张新封面挤掉，导致反复重下。
+struct Cache<V> {
+    map: HashMap<String, (u64, V)>,
+    seq: u64,
+    max: usize,
+}
+
+impl<V: Clone> Cache<V> {
+    fn new(max: usize) -> Self {
+        Self { map: HashMap::new(), seq: 0, max }
+    }
+
+    fn get(&mut self, key: &str) -> Option<V> {
+        self.seq += 1;
+        let at = self.seq;
+        let entry = self.map.get_mut(key)?;
+        entry.0 = at;   // 命中即刷新，变成「最近用过」
+        Some(entry.1.clone())
+    }
+
+    fn put(&mut self, key: String, val: V) {
+        if self.map.len() >= self.max && !self.map.contains_key(&key) {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) {
+                self.map.remove(&oldest);
+            }
+        }
+        self.seq += 1;
+        let at = self.seq;
+        self.map.insert(key, (at, val));
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
+/// 按总字节数收敛（张数上限挡不住几张超大封面）
+fn trim_bytes(cache: &mut Cache<Arc<Vec<u8>>>, budget: usize) {
+    let mut total: usize = cache.map.values().map(|(_, bytes)| bytes.len()).sum();
+    while total > budget && cache.map.len() > 1 {
+        let Some(oldest) = cache.map.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        if let Some((_, bytes)) = cache.map.remove(&oldest) {
+            total = total.saturating_sub(bytes.len());
+        }
+    }
+}
+
+fn trim_img_cache() {
+    if let Ok(mut g) = IMG_CACHE.lock() {
+        trim_bytes(&mut g, IMG_CACHE_MAX_BYTES);
+    }
+}
+
+static IMG_CACHE: Lazy<Mutex<Cache<Arc<Vec<u8>>>>> = Lazy::new(|| Mutex::new(Cache::new(IMG_CACHE_MAX)));
 /* 清单缓存带时间戳：分片地址带时效签名，永久缓存会让签名过期后一直 403（只能重启或手动清缓存） */
-static PL_CACHE: Lazy<Mutex<HashMap<String, (Instant, Arc<String>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static SEG_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PL_CACHE: Lazy<Mutex<Cache<(Instant, Arc<String>)>>> = Lazy::new(|| Mutex::new(Cache::new(PL_CACHE_MAX)));
+static KEY_CACHE: Lazy<Mutex<Cache<(String, Arc<Vec<u8>>)>>> = Lazy::new(|| Mutex::new(Cache::new(KEY_CACHE_MAX)));
+static SEG_CACHE: Lazy<Mutex<Cache<(String, Arc<Vec<u8>>)>>> = Lazy::new(|| Mutex::new(Cache::new(SEG_CACHE_MAX)));
 
 const IMG_CACHE_MAX: usize = 240;
+/// 封面缓存的总字节预算：240 张几 MB 的封面能吃掉几百 MB 内存
+const IMG_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PL_CACHE_MAX: usize = 60;
 /// 清单缓存的存活时间：hls.js 不会频繁重取主清单，缓存太久只会留下过期的分片签名
 const PL_CACHE_TTL: Duration = Duration::from_secs(60);
 const KEY_CACHE_MAX: usize = 120;
 const SEG_CACHE_MAX: usize = 36;
 const SEG_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max: usize) {
-    let mut m = map.lock().unwrap();
-    if m.len() >= max {
-        if let Some(k) = m.keys().next().cloned() {
-            m.remove(&k);
-        }
-    }
-    m.insert(key, val);
-}
 
 /* ───────────────────────── AES ───────────────────────── */
 
@@ -109,7 +153,7 @@ fn image_kind(buf: &[u8]) -> Option<&'static str> {
 
 /// 取封面：命中缓存直接返回，否则下载并按需解密。
 pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
-    if let Some(hit) = IMG_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some(hit) = IMG_CACHE.lock().unwrap().get(url) {
         let kind = image_kind(&hit).unwrap_or("image/jpeg");
         return Ok((kind.to_string(), hit));
     }
@@ -122,7 +166,8 @@ pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
     };
     let kind = image_kind(&plain).unwrap_or("image/jpeg").to_string();
     let arc = Arc::new(plain);
-    cache_put(&IMG_CACHE, url.to_string(), arc.clone(), IMG_CACHE_MAX);
+    IMG_CACHE.lock().unwrap().put(url.to_string(), arc.clone());
+    trim_img_cache();
     Ok((kind, arc))
 }
 
@@ -206,7 +251,7 @@ fn playlist_cacheable(text: &str) -> bool {
 /// 取 m3u8 并把 key / 子列表 / 分片地址改写到本地协议。
 pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
     let cache_key = format!("{prefix}|{url}");
-    if let Some((at, hit)) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
+    if let Some((at, hit)) = PL_CACHE.lock().unwrap().get(&cache_key) {
         if at.elapsed() < PL_CACHE_TTL {
             return Ok(hit);
         }
@@ -218,7 +263,7 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     }
     let arc = Arc::new(rewrite_playlist(url, text, prefix));
     if playlist_cacheable(text) {
-        cache_put(&PL_CACHE, cache_key, (Instant::now(), arc.clone()), PL_CACHE_MAX);
+        PL_CACHE.lock().unwrap().put(cache_key, (Instant::now(), arc.clone()));
     }
     Ok(arc)
 }
@@ -277,10 +322,10 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
 
 /// 加载分片或 AES Key（带内存缓存，避免拖动进度条时重复拉取同一 Key 或分片导致卡顿）。
 pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
-    if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
-    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url) {
         return Ok((Some(ctype), hit));
     }
     let (ctype, bytes) = fetch_bytes(url).await?;
@@ -297,9 +342,9 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     let len = bytes.len();
     let arc = Arc::new(bytes);
     if len <= 65536 {
-        cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
+        KEY_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()));
     } else if len <= SEG_CACHE_MAX_BYTES {
-        cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+        SEG_CACHE.lock().unwrap().put(url.to_string(), (mime.clone(), arc.clone()));
     }
     Ok((Some(mime), arc))
 }
@@ -425,6 +470,29 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_evicts_the_least_recently_used_entry() {
+        let mut c: Cache<String> = Cache::new(2);
+        c.put("a".into(), "A".into());
+        c.put("b".into(), "B".into());
+        assert_eq!(c.get("a").as_deref(), Some("A"));   // a 变成最近用过
+        c.put("c".into(), "C".into());                  // 应该淘汰 b，而不是随机挑
+        assert!(c.get("a").is_some());
+        assert!(c.get("b").is_none());
+        assert!(c.get("c").is_some());
+    }
+
+    #[test]
+    fn image_cache_respects_its_byte_budget() {
+        let mut c: Cache<Arc<Vec<u8>>> = Cache::new(10);
+        for i in 0..4 {
+            c.put(format!("img{i}"), Arc::new(vec![0u8; 100]));
+        }
+        trim_bytes(&mut c, 250);                        // 预算 250 字节 → 只留 2 张
+        assert!(c.map.len() <= 2, "超出字节预算应该继续淘汰");
+        assert!(c.map.len() >= 1);
+    }
 
     #[test]
     fn only_vod_playlists_are_cached() {

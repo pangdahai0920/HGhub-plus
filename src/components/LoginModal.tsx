@@ -39,7 +39,7 @@ export default function LoginModal() {
       <div className="flex items-center gap-2 mb-3">
         <span className="w-8 h-8 rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center"><ILogin size={16} /></span>
         <span className="text-[15px] font-bold text-on">{mode === "login" ? "登录 HGhub" : "注册 HGhub"}</span>
-        <button onClick={() => setLoginOpen(false)} className="ml-auto w-7 h-7 rounded-full bg-s4 flex items-center justify-center text-mut pressable">
+        <button onClick={() => setLoginOpen(false)} aria-label="关闭登录" className="ml-auto w-7 h-7 rounded-full bg-s4 flex items-center justify-center text-mut pressable">
           <IClose size={13} />
         </button>
       </div>
@@ -53,12 +53,15 @@ export default function LoginModal() {
 
       <div className="flex flex-col gap-2.5">
         <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="账号"
+          aria-label="账号" autoComplete="username" name="username"
           className="h-10 px-3.5 rounded-(--r-sm) bg-s4 text-[13px] text-on placeholder-mut outline-none focus:ring-2 focus:ring-[var(--p-primary)]" />
         <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder="密码"
+          aria-label="密码" autoComplete={mode === "login" ? "current-password" : "new-password"} name="password"
           onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
           className="h-10 px-3.5 rounded-(--r-sm) bg-s4 text-[13px] text-on placeholder-mut outline-none focus:ring-2 focus:ring-[var(--p-primary)]" />
         {mode === "register" && (
           <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="邮箱（可选）"
+            aria-label="邮箱" autoComplete="email" name="email" inputMode="email"
             className="h-10 px-3.5 rounded-(--r-sm) bg-s4 text-[13px] text-on placeholder-mut outline-none focus:ring-2 focus:ring-[var(--p-primary)]" />
         )}
         {err && <div className="text-[11.5px] text-danger">{err}</div>}

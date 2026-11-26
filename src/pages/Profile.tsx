@@ -123,7 +123,10 @@ export default function Profile({ wide }: { wide: boolean }) {
               sub={tab === "fav" ? "在剧集页点收藏，之后就能在这里找到" : "看过的剧集会出现在这里"}
               action="去逛逛" onAction={() => push({ kind: "ranks" })} />
           )}
-          {cards.length > 0 && tab === "history" && (
+          {ids.length > 12 && (
+            <div className="mt-3 text-center text-[10px] text-dim">仅显示最近 12 条（共 {ids.length} 条）</div>
+          )}
+          {tab === "history" && history.length > 0 && (
             <button onClick={clearHistory} className="mt-3 w-full h-9 rounded-(--r-ctl) bg-s3 text-[12px] text-mut pressable">清空观看历史</button>
           )}
         </div>

@@ -7,7 +7,7 @@
 - 「已修复」的条目都附带验证方式（单元测试 / 浏览器回归 / 类型检查）。
 - 「待处理」是确认存在但需要设计变更、新增依赖或真实媒体环境才能安全改动的条目，已写明修法与风险。
 
-当前状态：**已修 19 条 / 待处理 18 条 / 误报 4 条**。测试：`cargo test --lib` 46 项、`pnpm test:feed` 52 项。
+当前状态：**已修 25 条 / 待处理 12 条 / 误报 4 条**。测试：`cargo test --lib` 49 项、`pnpm test:feed` 52 项。
 
 ---
 
@@ -44,6 +44,17 @@
 | 18 | `src/App.tsx` | 数字键 1~4 无条件切 tab 且清空导航栈：焦点在选集/搜索按钮上误按会把正在看的播放页关掉 | 抽成 `globalKeyHandler`：输入框让路，焦点在 `BUTTON/A/SELECT/SUMMARY/contenteditable` 时不生效 | 类型检查 + 代码复核 |
 | 19 | `src/store.tsx` | 每次状态变化都全量 `JSON.stringify` + 同步 `localStorage.setItem`（播放中每 5s、拖音量每帧），配额错误被静默吞掉 | 拆成 6 个分片键 + 200ms 防抖 + 只写变化的切片；`pagehide`/切后台/卸载时强制落盘；配额满先裁历史再重试，仍失败提示一次；旧整包键自动迁移 | 回归场景「旧存档自动迁移到分片键」+ 观看记录落盘断言 |
 
+### 第三轮（安全边界 + 资源与体验）
+
+| # | 位置 | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- | --- |
+| 20 | `src-tauri/src/api.rs` | `open_url` 只校验字面量 IP：`https://127.0.0.1.nip.io/` 这类解析到内网的域名能交给系统浏览器打开 | 打开前按当前安全模式走一遍 `network_policy::resolve_target`（真的解析 DNS 并校验地址），失败则拒绝并提示 | `cargo test` + 代码复核（DNS 校验依赖真实网络，未做联网用例） |
+| 21 | `src-tauri/src/net.rs` | 错误串里内嵌完整 URL（带 `auth_key` 时效签名），会经 `debug_log` 落盘、用户分享日志即泄露 | `err_text` 统一走 `redact_urls`：只保留 `scheme://host/path?…`，其余诊断信息原样保留 | Rust 单测 `error_text_never_carries_signed_query_strings` |
+| 22 | `src-tauri/src/media.rs` | 缓存用 `m.keys().next()` 随机淘汰：正在播的那一集分片可能被一张新封面挤掉，反复重下；图片缓存只按条数（240）不按字节 | 改成带访问序号的 LRU（命中即刷新，满了淘汰最久没用的）；封面缓存再加 32MB 总字节预算 | Rust 单测 `cache_evicts_the_least_recently_used_entry`、`image_cache_respects_its_byte_budget` |
+| 23 | `src/pages/Profile.tsx` | 收藏/历史只显示前 12 条却没有任何提示；「清空观看历史」按钮的显示依赖这 12 张卡片加载成功 | 超过 12 条时显示「仅显示最近 N 条（共 M 条）」；清空按钮改看 `history.length > 0` | 类型检查 + 代码复核 |
+| 24 | `src/pages/Posts.tsx` | 列表加载失败被 `catch {}` 吞掉：断网时显示「暂无吃瓜内容」，没有重试入口 | 记录错误并渲染「加载失败 + 重试」空态 | 类型检查 + 代码复核 |
+| 25 | `LoginModal` / `ui.tsx` / `Search` | 纯图标按钮没有可访问名（读屏只念「按钮」）；登录表单缺 `label`/`autoComplete`，密码管理器无法填充 | 补 `aria-label`、`autoComplete="username/current-password/new-password/email"`、`name`、`enterKeyHint` | 类型检查 + 代码复核 |
+
 ### 新增功能（不在审计项内）
 
 - **长按左右倍速**（`src/components/Feed.tsx`）：长按画面**右半 = 2.0x**、**左半 = 0.5x 慢放**，松开恢复，桌面与手机都生效。手机端原有「长按任意处 2x + 上滑锁定」保留（锁定只对右半生效）；桌面端新增按住 320ms 触发、移动超过 8px 取消、长按结束紧随的 click 不再当「点击暂停」。验证：桌面鼠标长按 + 安卓真实触摸长按各 4 项断言。
@@ -59,20 +70,14 @@
 | 中 | `src-tauri/src/lib.rs:95-129`、`media.rs:354` | 自定义 `hg` 协议是「任意公网 URL 取数代理」，且把请求的 `Origin` 原样反射进 `Access-Control-Allow-Origin`。CSP 里刻意不给 `connect-src:`，但 webview 内任意 JS 仍能 `fetch("http://hg.localhost/seg?u=…")` 读到任意公网响应，等于绕过 CSP 的网络隔离 | ACAO 只回显允许的前端 origin；`/seg` 的 `u` 主机名与本次会话播放列表里出现过的 host 求交集 |
 | 中 | `src-tauri/src/lib.rs:95-108`、`network_policy.rs` | `security_set(false)` 一个 IPC 同时关掉自定义协议的 Origin 校验与内网/保留地址拦截 → 一步降级为「本机/内网 SSRF 可用」 | 放宽操作加显式确认；或拆成「媒体兼容性」与「网络策略」两个开关，后者只允许收紧 |
 | 中 | `src-tauri/src/media.rs:379` | 大小上限已加，但命中缓存后仍 `as_ref().clone()` 整块复制一次分片（4MB/请求，并发预取 6 路 ≈ 48MB 瞬时） | 响应体改 `bytes::Bytes`/`Arc`，让 Response 直接持有共享缓冲 |
-| 中 | `src-tauri/src/media.rs:44-52` | 分片缓存用「随机键」淘汰而非 LRU，图片缓存只按条数（240）不按字节：正在看的剧的分片可能被新封面挤掉，反复重下；240 张封面可达数百 MB | 换 `lru`/记录访问序号；图片缓存加总字节预算 |
 | 中 | `src-tauri/src/playback_log.rs:128-202` | 开启诊断后每个分片请求触发 4~6 次同步磁盘写，并持有全局 `Mutex`（都在 tokio 任务里）：用户因为卡顿开诊断，诊断本身放大卡顿 | `mpsc` + 单消费者后台任务（`BufWriter`），`record()` 只做非阻塞投递 |
 | 中 | `src-tauri/src/session.rs` | token 仍是磁盘上的明文（已从共享 JSON 拆到单独的 0600 文件，但没进系统凭据库） | 接 `keyring` 存进 Windows 凭据管理器 / macOS Keychain；需新增跨平台依赖并在三平台验证构建，本轮未做 |
-| 低 | `src-tauri/src/net.rs:298-310` | 错误串包含带签名的完整 URL 与上游响应体前 160 字符，会经 `debug_log` 落盘 | 对外错误统一 redact（已有 `redact_proxy` 可复用） |
-| 低 | `src-tauri/src/api.rs:172` | `open_url` 只校验字面量 IP，不解析 DNS：`https://127.0.0.1.nip.io/` 可交给系统浏览器打开 | 复用 `network_policy::resolve_target` 再放行 |
 | 低 | `src-tauri/src/net.rs:149-192` | 连接池 30s TTL 到期即**新建** Client：每隔 30s 丢一次 keep-alive 全部重握手 | 地址校验结果与连接池解耦（Client 复用） |
 | 低 | `src-tauri/tauri.conf.json:52`、`.github/workflows/build-ios.yml` | iOS `developmentTeam` 是占位符；CI 把 ATS 全局关掉，与「只允许 HTTPS」的安全模型矛盾 | 团队 ID 由 CI 注入；ATS 收敛成 `NSExceptionDomains` |
 | 低 | `src/store.tsx:289-307` | 单一 context，`value` 依赖整个持久化状态：任一写入都会让所有 `useStore()` 消费者重渲染（含 1500 行的 Feed 与整个 deck） | 拆 context 或改 `useSyncExternalStore` + selector |
 | 低 | `src/components/VideoSurface.tsx:355` | `timeupdate` 每帧回灌父层 `setTime`，4Hz 全树重渲染 | 进度改订阅式，只让进度条/时码重渲染 |
 | 低 | `src/html.ts:137-149` | 兼容模式（关闭严格安全）退化为 `USE_PROFILES:{html:true}`，放弃显式标签白名单（CSS 注入/界面伪装，非脚本执行）；正文链接统一 `target=_blank`，中键点击绕过 React 拦截 | 兼容模式保留白名单，仅放宽 data-*；链接改由 `onAuxClick` 统一交 `openUrl` |
 | 低 | `src/App.tsx:241-249` | 安卓返回键顺序与注释相反：先退全屏再关面板 | 把 `runBack()` 提到 `fs` 之前 |
-| 低 | `src/pages/Profile.tsx:24` | 收藏/历史只取前 12 条且无「查看全部」提示；「清空历史」按钮的显示条件是卡片加载成功 | 分页或提示；按钮条件改 `history.length > 0` |
-| 低 | `src/pages/Posts.tsx:33` | 列表加载失败被 `catch {}` 吞掉，界面显示「暂无内容」且无重试 | 与 ChannelPage 一致的 `err + Empty action` |
-| 低 | 多处 | 纯图标按钮缺 `aria-label`（搜索清空、CloseBtn、登录关闭）；登录表单缺 `label`/`autoComplete`；Sheet/Modal 无 `role="dialog"`/Esc | 补齐无障碍属性 |
 | 低 | `src/components/cards.tsx`、`src/pages/*` | 卡片未 memo、`onOpen` 内联、瀑布流无限追加（无窗口化） | `memo` + 稳定回调；长列表窗口化 |
 
 ---
