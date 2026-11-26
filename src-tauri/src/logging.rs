@@ -7,6 +7,40 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 static DEBUG_WRITER: Mutex<()> = Mutex::new(());
 
+/// debug.log 超过这个大小就轮转一次（保留一份 .previous），避免长期运行后涨到几百 MB
+const DEBUG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// 单条消息的写入上限：前端可能把整段 HTML / JSON / 堆栈塞进来
+const DEBUG_MAX_MESSAGE: usize = 8 * 1024;
+
+/// 超长消息截断（按字符边界切，不会切坏 UTF-8）
+fn truncate_message(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.len() <= DEBUG_MAX_MESSAGE {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let mut cut = DEBUG_MAX_MESSAGE;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}…(已截断 {} 字节)",
+        &message[..cut],
+        message.len() - cut
+    ))
+}
+
+/// 超过上限就把 debug.log 挪成 debug.log.previous（旧的那份直接删）
+fn rotate_if_needed(dir: &Path) {
+    let path = dir.join("debug.log");
+    let Ok(meta) = fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() <= DEBUG_MAX_BYTES {
+        return;
+    }
+    let _ = fs::remove_file(dir.join("debug.log.previous"));
+    let _ = fs::rename(&path, dir.join("debug.log.previous"));
+}
+
 fn format_utc(at: OffsetDateTime) -> Result<String, String> {
     at.to_offset(UtcOffset::UTC)
         .format(&Rfc3339)
@@ -20,6 +54,8 @@ pub(crate) fn utc_timestamp() -> Result<String, String> {
 pub(crate) fn append_debug(dir: &Path, message: &str) -> Result<(), String> {
     let _writer = DEBUG_WRITER.lock().map_err(|_| "日志锁失败")?;
     fs::create_dir_all(dir).map_err(|_| "无法创建日志目录")?;
+    rotate_if_needed(dir);
+    let message = truncate_message(message);
     let at = utc_timestamp()?;
     let prefix = format!("[{at}] [pid={}] ", std::process::id());
     let mut record = String::new();
@@ -126,6 +162,29 @@ mod tests {
             assert_eq!(pair[1], pair[0].replace("start ", "end "));
             assert!(pair[0].contains("Z] [pid="));
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_message_is_truncated_on_a_char_boundary() {
+        let dir = test_dir();
+        let message = "汉".repeat(DEBUG_MAX_MESSAGE);   // 3 字节/字，必然超过 8KB
+        append_debug(&dir, &message).unwrap();
+        let text = fs::read_to_string(dir.join("debug.log")).unwrap();
+        assert!(text.len() < DEBUG_MAX_MESSAGE + 1024, "写入前必须截断");
+        assert!(text.contains("已截断"), "截断要留标记");
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_log_rotates_to_previous() {
+        let dir = test_dir();
+        fs::write(dir.join("debug.log"), vec![b'x'; (DEBUG_MAX_BYTES + 1) as usize]).unwrap();
+        append_debug(&dir, "after rotate").unwrap();
+        assert!(dir.join("debug.log.previous").exists(), "超限的旧日志应被挪走");
+        let now = fs::read_to_string(dir.join("debug.log")).unwrap();
+        assert!(now.contains("after rotate") && (now.len() as u64) < DEBUG_MAX_BYTES);
         fs::remove_dir_all(dir).unwrap();
     }
 }

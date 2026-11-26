@@ -193,7 +193,13 @@ try {
     await page.waitForTimeout(300);
     await page.locator(".desktop-dock-panel button", { hasText: /^3$/ }).first().click();
     check("选集跳到第 3 集", (await waitSlide(page, 102, 3)).ep, 3);
-    const history = await page.evaluate(() => JSON.parse(localStorage.getItem("hghub_app_v1") || "{}").history || []);
+    /* 存档已拆成分片键：history 在 hghub_history_v1（旧的整包键只做迁移来源）。
+       写入现在是 200ms 防抖，读之前先等它落盘。 */
+    await page.waitForFunction(() => {
+      const h = JSON.parse(localStorage.getItem("hghub_history_v1") || "[]");
+      return h[0] && h[0].ep === 3 && h[0].id === 102;
+    }, null, { timeout: 4000 });
+    const history = await page.evaluate(() => JSON.parse(localStorage.getItem("hghub_history_v1") || "[]"));
     check("观看记录停在当前集", [history[0].id, history[0].ep], [102, 3]);
     await page.screenshot({ path: join(output, "home.png") });
     check("首页无脚本错误", errors, []);
@@ -213,6 +219,13 @@ try {
     await page.locator("button", { hasText: "剧B" }).last().click();
     const s = await waitSlide(page, 102, 3);
     check("续播落在第 3 集（剧集展开后索引跟着走）", [s.video, s.ep], [102, 3]);
+    /* 旧版本把全部状态塞在 hghub_app_v1：新版本要自动迁移到分片键 */
+    await page.waitForFunction(() => !!localStorage.getItem("hghub_history_v1"), null, { timeout: 5000 });
+    check("旧存档自动迁移到分片键", await page.evaluate(() => {
+      const legacy = JSON.parse(localStorage.getItem("hghub_app_v1") || "{}");
+      const part = JSON.parse(localStorage.getItem("hghub_history_v1") || "[]");
+      return { legacyHas: Array.isArray(legacy.history), partCount: part.length >= 1 };
+    }), { legacyHas: true, partCount: true });
     await page.keyboard.press("ArrowUp");
     check("续播后上滑 = 第 2 集", (await waitSlide(page, 102, 2)).ep, 2);
     await page.keyboard.press("ArrowDown"); await waitSlide(page, 102, 3);
@@ -288,6 +301,52 @@ try {
     await context.close();
   }
 
+  /* 4.8 桌面长按：右半 2x / 左半 0.5x，松开恢复；短按不算长按 */
+  {
+    const { page, context, errors } = await open({});
+    await page.waitForSelector("section[data-video]");
+    await waitSlide(page, 101, 1);
+    await page.waitForFunction(() => !!document.querySelector("video"), null, { timeout: 8000 });
+    const box = await page.locator('section[data-video="101"][data-ep="1"]').first().boundingBox();
+    const rate = () => page.evaluate(() => document.querySelector("video")?.playbackRate ?? -1);
+    const holdAt = async (fx, ms) => {
+      await page.mouse.move(box.x + box.width * fx, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.waitForTimeout(ms);
+      const during = await rate();
+      await page.mouse.up();
+      await page.waitForTimeout(250);
+      return { during, after: await rate() };
+    };
+
+    const right = await holdAt(0.78, 450);
+    check("长按右半 = 2x", right.during, 2);
+    check("松开后回到 1x", right.after, 1);
+
+    const left = await holdAt(0.22, 450);
+    check("长按左半 = 0.5x 慢放", left.during, 0.5);
+    check("松开后回到 1x（左半）", left.after, 1);
+
+    const quick = await holdAt(0.78, 120);
+    check("短按不算长按，倍速不变", [quick.during, quick.after], [1, 1]);
+
+    /* 长按中的提示条 */
+    await page.mouse.move(box.x + box.width * 0.78, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(400);
+    const hint = await page.evaluate(() => {
+      const el = [...document.querySelectorAll("div")].find((n) => (n.textContent || "").includes("倍速中（右半）"));
+      return !!el;
+    });
+    check("长按时有倍速提示", hint, true);
+    await page.mouse.up();
+    await page.waitForTimeout(200);
+
+    check("长按倍速无脚本错误", errors, []);
+    await page.screenshot({ path: join(output, "long-press.png") });
+    await context.close();
+  }
+
   /* 5. 安卓：真实触摸上滑 */
   {
     const { page, context, errors } = await open({ mobile: true });
@@ -317,6 +376,25 @@ try {
     check("集数标签跟着更新", await epLabel(), "详情 · 第 2 集");
     await swipe();
     check("再上滑 = 第 3 集", (await waitSlide(page, 101, 3)).ep, 3);
+
+    /* 手机端长按：右半 2x / 左半 0.5x（真实触摸） */
+    const holdTouch = async (fx, ms) => {
+      const b = await page.locator(".no-bar").boundingBox();
+      const x = b.x + b.width * fx;
+      const y = b.y + b.height * 0.5;
+      await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+      await page.waitForTimeout(ms);
+      const during = await page.evaluate(() => document.querySelector("video")?.playbackRate ?? -1);
+      await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+      await page.waitForTimeout(300);
+      return { during, after: await page.evaluate(() => document.querySelector("video")?.playbackRate ?? -1) };
+    };
+    const touchRight = await holdTouch(0.78, 600);
+    check("手机长按右半 = 2x", touchRight.during, 2);
+    check("手机松开回到 1x", touchRight.after, 1);
+    const touchLeft = await holdTouch(0.22, 600);
+    check("手机长按左半 = 0.5x", touchLeft.during, 0.5);
+    check("手机松开回到 1x（左半）", touchLeft.after, 1);
 
     /* 全屏进出后仍停在原来那一集（scrollTop 要重新对齐）。全屏时其它屏 display:none，
        所以看「还占着视口的那一屏」是谁。惯性滑动可能一次翻过两集，这里以实际停稳的那一屏为准。 */

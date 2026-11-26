@@ -7,13 +7,17 @@
 - 「已修复」的条目都附带验证方式（单元测试 / 浏览器回归 / 类型检查）。
 - 「待处理」是确认存在但需要设计变更、新增依赖或真实媒体环境才能安全改动的条目，已写明修法与风险。
 
+当前状态：**已修 19 条 / 待处理 18 条 / 误报 4 条**。测试：`cargo test --lib` 46 项、`pnpm test:feed` 52 项。
+
 ---
 
 ## 一、已修复
 
+### 第一轮（逐集滑片 + 第一批缺陷）
+
 | # | 位置 | 问题 | 修复 | 验证 |
 | --- | --- | --- | --- | --- |
-| 1 | `src/components/Feed.tsx` | 向下滑是「下一部短剧」，不是「下一集」 | 改成逐集滑片（deck）：一部剧的每一集各占一屏，滑完最后一集才进下一部；索引由「哪部剧第几集」反推，续播/选集/延迟展开都不会错位 | `pnpm test:feed`（40 项断言，含跨剧边界、续播、120 集长剧、安卓触摸、全屏对齐） |
+| 1 | `src/components/Feed.tsx` | 向下滑是「下一部短剧」，不是「下一集」 | 改成逐集滑片（deck）：一部剧的每一集各占一屏，滑完最后一集才进下一部；索引由「哪部剧第几集」反推，续播/选集/延迟展开都不会错位 | `pnpm test:feed`（52 项断言：跨剧边界、续播、120 集长剧、安卓触摸、全屏对齐、长按倍速） |
 | 2 | `src/components/Feed.tsx` | 容器尺寸变化（全屏/窗口缩放）会打断正在进行的翻页动画；连按翻页会因索引未提交而空转；剧集详情未到时下滑被吞 | 只在「当前屏真的移动」时对齐 `scrollTop`；翻页基准改为「正在滑向的目标」；被吞的下滑记为 `pendingAdvance`，详情到达后补上 | 同上（含连按、全屏进出、详情慢 2.5s 三个场景） |
 | 3 | `src/pages/Search.tsx` | 搜索无请求序号：慢网络下「先搜都市再搜逆袭」，逆袭的结果会被都市的旧响应覆盖，标题与内容不一致 | 请求序号 + 只对同一次搜索的翻页去重；旧响应一律丢弃 | 类型检查 + 代码复核（无自动化场景，需可编排的慢接口） |
 | 4 | `src/components/Panels.tsx` | 评论面板无请求序号：切集时第 1 集的评论会覆盖/追加到第 2 集 | 同上，按序号丢弃过期响应 | 类型检查 + 代码复核 |
@@ -28,6 +32,22 @@
 
 > 第 12 条说明：Chromium 对 `src=""` 不会触发 `error`，所以「空地址 → 真封面」这条路径本身不会复现灰块；真正会复现的是「先失败一次（断网/404）再换地址」。此条按**硬化**处理，不宣称修掉了用户可见故障。
 
+### 第二轮（P0 稳定性 + P1 体感）
+
+| # | 位置 | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- | --- |
+| 13 | `src-tauri/src/net.rs` | `resp.bytes()` 把整个响应无条件读进内存且无上限：异常清单指向大文件就能打满内存，release 是 `panic=abort`，直接崩 | 先看 `Content-Length` 预判，再 `resp.chunk()` 边读边累计，超 32MB 中止；该错误标记为不可重试（不会把大文件重拉 3 次） | Rust 单测（重试分类）+ 代码复核 |
+| 14 | `src-tauri/src/media.rs` | m3u8 清单永久缓存，但分片 URL 带时效签名：过期后一直 403，只能重启或清缓存 | 清单缓存加 60s TTL；滑动窗口直播（有 `EXT-X-MEDIA-SEQUENCE` 且无 `ENDLIST`）不缓存 | Rust 单测 `only_vod_playlists_are_cached` |
+| 15 | `src-tauri/src/session.rs` | 登录 token 与用户资料存在同一个明文 JSON 里，用户拿去反馈/备份就带着凭据 | `Session.token` 改 `skip_serializing`，token 单独写 `session.token`（原子写 + Unix 0600），退出登录删除；旧版本写在 JSON 里的 token 在 `bind` 时自动迁移并抹掉 | Rust 单测 `token_never_lands_in_the_plain_json`、`legacy_token_inside_json_is_migrated_out` |
+| 16 | `src-tauri/src/logging.rs` | `debug.log` 无大小上限、单条消息不限长：长期运行可涨到几百 MB，还会把上游 HTML/JSON 整段写进去 | 超过 4MB 轮转（保留一份 `.previous`）；单条消息按字符边界截断到 8KB 并标注截断字节数 | Rust 单测 `oversized_log_rotates_to_previous`、`oversized_message_is_truncated_on_a_char_boundary` |
+| 17 | `src/App.tsx` | 全局禁用右键：桌面端在输入框/登录框里**无法右键粘贴** | 只拦页面主体，`input/textarea/contenteditable` 放行 | 类型检查 + 代码复核 |
+| 18 | `src/App.tsx` | 数字键 1~4 无条件切 tab 且清空导航栈：焦点在选集/搜索按钮上误按会把正在看的播放页关掉 | 抽成 `globalKeyHandler`：输入框让路，焦点在 `BUTTON/A/SELECT/SUMMARY/contenteditable` 时不生效 | 类型检查 + 代码复核 |
+| 19 | `src/store.tsx` | 每次状态变化都全量 `JSON.stringify` + 同步 `localStorage.setItem`（播放中每 5s、拖音量每帧），配额错误被静默吞掉 | 拆成 6 个分片键 + 200ms 防抖 + 只写变化的切片；`pagehide`/切后台/卸载时强制落盘；配额满先裁历史再重试，仍失败提示一次；旧整包键自动迁移 | 回归场景「旧存档自动迁移到分片键」+ 观看记录落盘断言 |
+
+### 新增功能（不在审计项内）
+
+- **长按左右倍速**（`src/components/Feed.tsx`）：长按画面**右半 = 2.0x**、**左半 = 0.5x 慢放**，松开恢复，桌面与手机都生效。手机端原有「长按任意处 2x + 上滑锁定」保留（锁定只对右半生效）；桌面端新增按住 320ms 触发、移动超过 8px 取消、长按结束紧随的 click 不再当「点击暂停」。验证：桌面鼠标长按 + 安卓真实触摸长按各 4 项断言。
+
 ---
 
 ## 二、确认存在、暂未修复（需要设计变更/新增依赖/真实媒体环境）
@@ -38,23 +58,18 @@
 | --- | --- | --- | --- |
 | 中 | `src-tauri/src/lib.rs:95-129`、`media.rs:354` | 自定义 `hg` 协议是「任意公网 URL 取数代理」，且把请求的 `Origin` 原样反射进 `Access-Control-Allow-Origin`。CSP 里刻意不给 `connect-src:`，但 webview 内任意 JS 仍能 `fetch("http://hg.localhost/seg?u=…")` 读到任意公网响应，等于绕过 CSP 的网络隔离 | ACAO 只回显允许的前端 origin；`/seg` 的 `u` 主机名与本次会话播放列表里出现过的 host 求交集 |
 | 中 | `src-tauri/src/lib.rs:95-108`、`network_policy.rs` | `security_set(false)` 一个 IPC 同时关掉自定义协议的 Origin 校验与内网/保留地址拦截 → 一步降级为「本机/内网 SSRF 可用」 | 放宽操作加显式确认；或拆成「媒体兼容性」与「网络策略」两个开关，后者只允许收紧 |
-| 中 | `src-tauri/src/net.rs:638`、`media.rs:379` | `resp.bytes()` 无大小上限，随后 `as_ref().clone()` 再复制一份：一个异常清单指向 1GB 文件就能打满内存（`panic=abort` 直接崩） | `Content-Length` 硬上限 + 分块累计；响应体改 `Bytes`/`Arc<Vec<u8>>` 避免整块复制 |
+| 中 | `src-tauri/src/media.rs:379` | 大小上限已加，但命中缓存后仍 `as_ref().clone()` 整块复制一次分片（4MB/请求，并发预取 6 路 ≈ 48MB 瞬时） | 响应体改 `bytes::Bytes`/`Arc`，让 Response 直接持有共享缓冲 |
 | 中 | `src-tauri/src/media.rs:44-52` | 分片缓存用「随机键」淘汰而非 LRU，图片缓存只按条数（240）不按字节：正在看的剧的分片可能被新封面挤掉，反复重下；240 张封面可达数百 MB | 换 `lru`/记录访问序号；图片缓存加总字节预算 |
 | 中 | `src-tauri/src/playback_log.rs:128-202` | 开启诊断后每个分片请求触发 4~6 次同步磁盘写，并持有全局 `Mutex`（都在 tokio 任务里）：用户因为卡顿开诊断，诊断本身放大卡顿 | `mpsc` + 单消费者后台任务（`BufWriter`），`record()` 只做非阻塞投递 |
-| 中 | `src-tauri/src/media.rs:195-208` | `PL_CACHE` 的 m3u8 永久缓存无 TTL，但分片 URL 带时效签名：签名过期后播放器一直 403，只能重启或清缓存；与 `Cache-Control: no-store` 语义矛盾 | 加短 TTL（VOD 可较长），直播清单不缓存 |
-| 中 | `src-tauri/src/session.rs:110` | token 仍以明文 JSON 落盘（本次已改为原子写 + 0600，但没做加密/系统凭据库） | 接 `keyring`/stronghold 保存 token |
-| 低 | `src-tauri/src/logging.rs` | `debug.log` 无上限、无轮转，`debug_log` 不限制长度 | 复用 playback.log 的轮转；入口截断 |
+| 中 | `src-tauri/src/session.rs` | token 仍是磁盘上的明文（已从共享 JSON 拆到单独的 0600 文件，但没进系统凭据库） | 接 `keyring` 存进 Windows 凭据管理器 / macOS Keychain；需新增跨平台依赖并在三平台验证构建，本轮未做 |
 | 低 | `src-tauri/src/net.rs:298-310` | 错误串包含带签名的完整 URL 与上游响应体前 160 字符，会经 `debug_log` 落盘 | 对外错误统一 redact（已有 `redact_proxy` 可复用） |
 | 低 | `src-tauri/src/api.rs:172` | `open_url` 只校验字面量 IP，不解析 DNS：`https://127.0.0.1.nip.io/` 可交给系统浏览器打开 | 复用 `network_policy::resolve_target` 再放行 |
 | 低 | `src-tauri/src/net.rs:149-192` | 连接池 30s TTL 到期即**新建** Client：每隔 30s 丢一次 keep-alive 全部重握手 | 地址校验结果与连接池解耦（Client 复用） |
 | 低 | `src-tauri/tauri.conf.json:52`、`.github/workflows/build-ios.yml` | iOS `developmentTeam` 是占位符；CI 把 ATS 全局关掉，与「只允许 HTTPS」的安全模型矛盾 | 团队 ID 由 CI 注入；ATS 收敛成 `NSExceptionDomains` |
-| 低 | `src/store.tsx:160` | 每次状态变化都全量 `JSON.stringify` + 同步 `localStorage.setItem`（播放中每 5s 一次、拖音量每帧一次），配额错误被吞 | 按 key 分片 + debounce；配额失败降级并提示 |
 | 低 | `src/store.tsx:289-307` | 单一 context，`value` 依赖整个持久化状态：任一写入都会让所有 `useStore()` 消费者重渲染（含 1500 行的 Feed 与整个 deck） | 拆 context 或改 `useSyncExternalStore` + selector |
 | 低 | `src/components/VideoSurface.tsx:355` | `timeupdate` 每帧回灌父层 `setTime`，4Hz 全树重渲染 | 进度改订阅式，只让进度条/时码重渲染 |
 | 低 | `src/html.ts:137-149` | 兼容模式（关闭严格安全）退化为 `USE_PROFILES:{html:true}`，放弃显式标签白名单（CSS 注入/界面伪装，非脚本执行）；正文链接统一 `target=_blank`，中键点击绕过 React 拦截 | 兼容模式保留白名单，仅放宽 data-*；链接改由 `onAuxClick` 统一交 `openUrl` |
 | 低 | `src/App.tsx:241-249` | 安卓返回键顺序与注释相反：先退全屏再关面板 | 把 `runBack()` 提到 `fs` 之前 |
-| 低 | `src/App.tsx:264` | 全局禁用右键菜单，桌面端在输入框里无法右键粘贴 | 只挂到播放器容器，或放行 `input/textarea/contenteditable` |
-| 低 | `src/App.tsx:111` | 全局数字键切 tab 会清空导航栈：焦点在按钮上按 `2` 会把正在看的播放页关掉 | 排除 `BUTTON/A/SELECT/[contenteditable]` |
 | 低 | `src/pages/Profile.tsx:24` | 收藏/历史只取前 12 条且无「查看全部」提示；「清空历史」按钮的显示条件是卡片加载成功 | 分页或提示；按钮条件改 `history.length > 0` |
 | 低 | `src/pages/Posts.tsx:33` | 列表加载失败被 `catch {}` 吞掉，界面显示「暂无内容」且无重试 | 与 ChannelPage 一致的 `err + Empty action` |
 | 低 | 多处 | 纯图标按钮缺 `aria-label`（搜索清空、CloseBtn、登录关闭）；登录表单缺 `label`/`autoComplete`；Sheet/Modal 无 `role="dialog"`/Esc | 补齐无障碍属性 |
@@ -78,3 +93,4 @@
 - `Feed` 的 `kind="post"` 分支（吃瓜帖复用播放器界面）当前没有任何调用方：`store` 里保留了 `feedKind` 字段但没人传 `"post"`。属死代码，删掉可简化约 80 行；保留则是给未来「帖子进信息流」留的口子。
 - 前端产物单包约 925KB（gzip 286KB），其中 hls.js 占大头。Tauri 本地加载对首屏影响不大，若将来做 Web 端再考虑拆包。
 - `pnpm test:playback` 依赖 ffmpeg 生成 HLS 夹具；`pnpm test:feed` 不依赖网络与媒体，CI 里已挂到 playback 流水线。
+- 安卓打包本轮**保留**：`android:*` 脚本、`release.yml` 的 android job、`sync-android-icons.mjs` 均未改动。

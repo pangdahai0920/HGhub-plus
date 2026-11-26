@@ -11,6 +11,7 @@ use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::http::{Response, StatusCode};
 
 /// 本平台自定义协议的完整基址。
@@ -28,7 +29,8 @@ const IMG_IV: &[u8] = b"97b60394abc2fbe1";
 
 static IMG_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
+/* 清单缓存带时间戳：分片地址带时效签名，永久缓存会让签名过期后一直 403（只能重启或手动清缓存） */
+static PL_CACHE: Lazy<Mutex<HashMap<String, (Instant, Arc<String>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -37,6 +39,8 @@ static SEG_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
 
 const IMG_CACHE_MAX: usize = 240;
 const PL_CACHE_MAX: usize = 60;
+/// 清单缓存的存活时间：hls.js 不会频繁重取主清单，缓存太久只会留下过期的分片签名
+const PL_CACHE_TTL: Duration = Duration::from_secs(60);
 const KEY_CACHE_MAX: usize = 120;
 const SEG_CACHE_MAX: usize = 36;
 const SEG_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -191,11 +195,21 @@ fn rewrite_uri_attr(line: &str, prefix: &str) -> String {
     map_uri_attributes(line, |uri| format!("{prefix}/seg?u={}", enc(uri)))
 }
 
+/// VOD 清单才缓存：滑动窗口直播（有 EXT-X-MEDIA-SEQUENCE 又没有 ENDLIST）的分片列表会变，
+/// 缓存住只会让播放器一直停在最后一帧。
+fn playlist_cacheable(text: &str) -> bool {
+    let has_endlist = text.contains("#EXT-X-ENDLIST");
+    let sliding = text.contains("#EXT-X-MEDIA-SEQUENCE") && !has_endlist;
+    !sliding
+}
+
 /// 取 m3u8 并把 key / 子列表 / 分片地址改写到本地协议。
 pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
     let cache_key = format!("{prefix}|{url}");
-    if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
-        return Ok(hit);
+    if let Some((at, hit)) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
+        if at.elapsed() < PL_CACHE_TTL {
+            return Ok(hit);
+        }
     }
     let (_, bytes) = fetch_bytes(url).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "播放列表不是 UTF-8 文本")?;
@@ -203,7 +217,9 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
         return Err("响应不是 HLS 播放列表".into());
     }
     let arc = Arc::new(rewrite_playlist(url, text, prefix));
-    cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
+    if playlist_cacheable(text) {
+        cache_put(&PL_CACHE, cache_key, (Instant::now(), arc.clone()), PL_CACHE_MAX);
+    }
     Ok(arc)
 }
 
@@ -409,6 +425,16 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_vod_playlists_are_cached() {
+        // VOD：带 ENDLIST → 缓存
+        assert!(playlist_cacheable("#EXTM3U\n#EXT-X-ENDLIST\nseg1.ts\n"));
+        // 主清单：既没有 MEDIA-SEQUENCE 也没有 ENDLIST → 缓存
+        assert!(playlist_cacheable("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nv/list.m3u8\n"));
+        // 滑动窗口直播：有 MEDIA-SEQUENCE 且没有 ENDLIST → 不缓存
+        assert!(!playlist_cacheable("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:120\nseg1.ts\n"));
+    }
 
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {

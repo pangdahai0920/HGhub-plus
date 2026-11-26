@@ -379,6 +379,10 @@ fn retryable_error(error: &str) -> bool {
     if error == "401" {
         return false;
     }
+    /* 响应体超限是上游/清单的问题，重试只会把同一个大文件再拉一遍 */
+    if error.starts_with("响应体过大") {
+        return false;
+    }
     if let Some(status) = error
         .strip_prefix("HTTP ")
         .and_then(|s| s.split_whitespace().next())
@@ -604,6 +608,10 @@ pub async fn edge(
     }
 }
 
+/// 单个响应体的硬上限（32MB）。分片 / 封面 / 清单都远小于它；
+/// 超限说明上游异常或清单被篡改，绝不能把整个响应读进内存（release 是 panic=abort，会直接崩）。
+pub(crate) const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -635,8 +643,23 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
-                Ok((ctype, bytes))
+                /* 先看 Content-Length 预判，再边读边计数：两道都给，避免上游不报长度时被撑爆 */
+                if let Some(len) = resp.content_length() {
+                    if len as usize > MAX_BODY_BYTES {
+                        return Err(format!("响应体过大（{len} 字节）"));
+                    }
+                }
+                let mut resp = resp;
+                let mut buf: Vec<u8> = Vec::with_capacity(
+                    resp.content_length().unwrap_or(0).min(MAX_BODY_BYTES as u64) as usize,
+                );
+                while let Some(chunk) = resp.chunk().await.map_err(|e| err_text(&e))? {
+                    if buf.len() + chunk.len() > MAX_BODY_BYTES {
+                        return Err(format!("响应体过大（超过 {MAX_BODY_BYTES} 字节）"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok((ctype, buf))
             }.await;
             crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
             result

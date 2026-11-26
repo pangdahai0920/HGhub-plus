@@ -55,6 +55,16 @@ type Persist = {
 };
 
 const LS = "hghub_app_v1";
+/** 分片存储：播放时每 5 秒写一次历史、拖音量每帧写一次，全量写一个大 JSON 会卡主线程 */
+const LS_PARTS = {
+  prefs: "hghub_prefs_v1",
+  likes: "hghub_likes_v1",
+  favs: "hghub_favs_v1",
+  follows: "hghub_follows_v1",
+  history: "hghub_history_v1",
+  search: "hghub_search_v1",
+} as const;
+
 const DEFAULTS: Persist = {
   likes: [], favs: [], history: [], follows: [],
   muted: true, muteOnStartup: true, volume: 0.7, searchHist: [],
@@ -83,28 +93,42 @@ const numList = (raw: unknown): number[] =>
 const strList = (raw: unknown): string[] =>
   Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string" && x.length > 0) : [];
 
+/** 读一个分片键；没有/坏了就返回兜底值 */
+function readPart<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 function loadPersist(): Persist {
+  /* 旧版本把全部状态塞在 `hghub_app_v1` 一个键里：先当兜底读，再被分片覆盖 ——
+     首次启动新版本即完成迁移，老用户的收藏/历史不会丢 */
+  let legacy: Partial<Persist> = {};
   try {
     const raw = localStorage.getItem(LS);
-    if (!raw) return DEFAULTS;
-    const p = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Persist>) };
-    // 只在启动时应用；本次使用中取消静音不会关闭此偏好。
-    const muteOnStartup = p.muteOnStartup !== false;
-    const volume = Number.isFinite(p.volume) ? Math.max(0, Math.min(1, Number(p.volume))) : DEFAULTS.volume;
-    return {
-      ...p,
-      likes: numList(p.likes),
-      favs: numList(p.favs),
-      follows: numList(p.follows),
-      searchHist: strList(p.searchHist).slice(0, 12),
-      history: normalizeHistory(p.history).slice(0, 80),
-      volume,
-      muteOnStartup,
-      muted: muteOnStartup || p.muted === true,
-    };
-  } catch {
-    return DEFAULTS;
-  }
+    if (raw) legacy = JSON.parse(raw) as Partial<Persist>;
+  } catch { /* 存档损坏就当没有，全部回退默认值 */ }
+
+  const prefs = readPart<{ muted?: unknown; muteOnStartup?: unknown; volume?: unknown } | null>(LS_PARTS.prefs, null);
+  const muteOnStartup = (prefs ? prefs.muteOnStartup : legacy.muteOnStartup) !== false;
+  const rawVolume = Number(prefs && prefs.volume !== undefined ? prefs.volume : legacy.volume);
+  const volume = Number.isFinite(rawVolume) ? Math.max(0, Math.min(1, rawVolume)) : DEFAULTS.volume;
+  const muted = prefs && prefs.muted !== undefined ? prefs.muted === true : legacy.muted === true;
+
+  return {
+    likes: numList(readPart<unknown>(LS_PARTS.likes, legacy.likes)),
+    favs: numList(readPart<unknown>(LS_PARTS.favs, legacy.favs)),
+    follows: numList(readPart<unknown>(LS_PARTS.follows, legacy.follows)),
+    history: normalizeHistory(readPart<unknown>(LS_PARTS.history, legacy.history)).slice(0, 80),
+    searchHist: strList(readPart<unknown>(LS_PARTS.search, legacy.searchHist)).slice(0, 12),
+    volume,
+    muteOnStartup,
+    muted: muteOnStartup || muted,
+  };
 }
 
 function readTheme(): Theme {
@@ -174,9 +198,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try { localStorage.setItem("hghub_theme", theme); } catch { /* ignore */ }
   }, [theme]);
 
-  useEffect(() => {
-    try { localStorage.setItem(LS, JSON.stringify(p)); } catch { /* ignore */ }
-  }, [p]);
+  /* 存档改为分片 + 防抖写入，见下面 flushWrites（这里不再全量写 hghub_app_v1） */
 
   useEffect(() => {
     api.boot()
@@ -209,6 +231,74 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setToasts((t) => [...t.slice(-2), { id, msg, icon }]);
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2200);
   }, []);
+
+  /* —— 分片 + 防抖落盘 ——
+     播放时每 5 秒写一次历史、拖音量每帧都在改状态；如果每次都 stringify 整个存档再同步写，
+     会在主线程上反复做全量序列化。这里只写变化的切片，并合并 200ms 内的多次改动。 */
+  const pendingWrites = useRef<Record<string, string>>({});
+  const lastWritten = useRef<Record<string, string>>({});
+  const flushTimer = useRef<number | undefined>(undefined);
+  const quotaWarned = useRef(false);
+
+  const flushWrites = useCallback(() => {
+    window.clearTimeout(flushTimer.current);
+    flushTimer.current = undefined;
+    const pending = pendingWrites.current;
+    pendingWrites.current = {};
+    for (const [key, text] of Object.entries(pending)) {
+      try {
+        localStorage.setItem(key, text);
+      } catch {
+        let recovered = false;
+        /* 配额满：历史先砍到 20 条再试一次；仍然失败就提示一次，
+           否则用户会以为收藏成功了，其实重启后没了 */
+        if (key === LS_PARTS.history) {
+          try {
+            const entries = JSON.parse(text) as unknown[];
+            localStorage.setItem(key, JSON.stringify(entries.slice(0, 20)));
+            recovered = true;
+          } catch { /* ignore */ }
+        }
+        if (!recovered && !quotaWarned.current) {
+          quotaWarned.current = true;
+          toast("本地存储已满，部分收藏/历史可能没有保存");
+        }
+      }
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    const slices: [string, unknown][] = [
+      [LS_PARTS.prefs, { muted: p.muted, muteOnStartup: p.muteOnStartup, volume: p.volume }],
+      [LS_PARTS.likes, p.likes],
+      [LS_PARTS.favs, p.favs],
+      [LS_PARTS.follows, p.follows],
+      [LS_PARTS.history, p.history],
+      [LS_PARTS.search, p.searchHist],
+    ];
+    let dirty = false;
+    for (const [key, value] of slices) {
+      const text = JSON.stringify(value);
+      if (lastWritten.current[key] === text) continue;
+      lastWritten.current[key] = text;
+      pendingWrites.current[key] = text;
+      dirty = true;
+    }
+    if (!dirty || flushTimer.current) return;
+    flushTimer.current = window.setTimeout(flushWrites, 200);
+  }, [p, flushWrites]);
+
+  /* 进后台/退出前把攒着的那点改动写掉（安卓进程被杀时尤其重要） */
+  useEffect(() => {
+    const onHide = () => { if (document.visibilityState === "hidden") flushWrites(); };
+    window.addEventListener("pagehide", flushWrites);
+    document.addEventListener("visibilitychange", onHide);
+    return () => {
+      flushWrites();
+      window.removeEventListener("pagehide", flushWrites);
+      document.removeEventListener("visibilitychange", onHide);
+    };
+  }, [flushWrites]);
 
   const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); setCleanState(false); }, []);
   const push = useCallback((pg: PageInput) => {

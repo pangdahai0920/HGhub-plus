@@ -138,11 +138,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [fullscreen, setFullscreen] = useState(false);
   const [heartBurst, setHeartBurst] = useState(0);
   /* —— 移动端手势 & 竖屏横片缩放 —— */
-  const [holdSpeed, setHoldSpeed] = useState(false);
+  /* 长按倍速：长按右半 = 2x、左半 = 0.5x 慢放；null = 没在长按 */
+  const [holdRate, setHoldRate] = useState<number | null>(null);
+  const [holdSide, setHoldSide] = useState<"left" | "right" | null>(null);
   const [speedLock, setSpeedLock] = useState(false);
   const [lockArmed, setLockArmed] = useState(false);
   const holdRef = useRef(false);
+  const holdSideRef = useRef<"left" | "right" | null>(null);
   const lockArmedRef = useRef(false);
+  /* 桌面端长按：按住画面 320ms 进入倍速，移动超过 8px 就取消（不影响点击暂停/拖动进度条） */
+  const deskPress = useRef<{ x: number; y: number; timer: number | null; held: boolean } | null>(null);
+  /* 长按结束后紧跟的那次 click 不能再当「点击暂停」处理 */
+  const suppressClickRef = useRef(false);
   const [scrub, setScrub] = useState<{ pct: number; target: number } | null>(null);
   const scrubTarget = useRef<number | null>(null);
   /* 竖屏下横屏视频适应模式 + 双指无级缩放/平移 */
@@ -289,7 +296,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   /* 倍速：长按 / 锁定 → 2.0x，否则用基准倍速 */
-  const effRate = holdSpeed || speedLock ? 2 : rate;
+  const effRate = holdRate ?? (speedLock ? 2 : rate);
   /* 进度条显示百分比（拖动时用拖动值） */
   const barProgress = barPct ?? (duration ? time / duration : 0);
   /* 是否为横屏视频（16:9 等宽大于高） */
@@ -646,7 +653,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     gesture.current = null;
     if (holdRef.current) {
       holdRef.current = false;
-      setHoldSpeed(false);
+      holdSideRef.current = null;
+      setHoldRate(null);
+      setHoldSide(null);
     }
     lockArmedRef.current = false;
     setLockArmed(false);
@@ -708,11 +717,22 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     }
   };
 
-  /* —— 长按 2x（上滑锁定） / 横拖定位 / 单击清屏 / 双击暂停 —— */
+  /* 长按落在哪一半：按「画面当前朝向」的横向坐标判断（横屏视频被 CSS 旋转 90° 时看 Y 轴） */
+  const holdSideAt = (clientX: number, clientY: number, el: HTMLElement | null): "left" | "right" => {
+    const r = el?.getBoundingClientRect();
+    if (!r) return "right";
+    const offset = rotated ? clientY - r.top : clientX - r.left;
+    const span = rotated ? r.height : r.width;
+    return offset < span / 2 ? "left" : "right";
+  };
+
+  /* —— 长按倍速（右半 2x / 左半 0.5x，上滑锁定只对 2x） / 横拖定位 / 单击清屏 / 双击暂停 —— */
   const onDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isDesktop || controlsLocked || !active || !e.isPrimary || pinchRef.current || gesture.current || e.button !== 0) return;
     const el = e.currentTarget;
     const span = rotated ? (el.clientHeight || window.innerHeight || 1) : (el.clientWidth || 1);
+    const atX = e.clientX;
+    const atY = e.clientY;
     try { el.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     const g = {
       x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY,
@@ -725,13 +745,63 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         clearTapTimer();
         cur.mode = "hold";
         holdRef.current = true;
-        setHoldSpeed(true);
+        const side = holdSideAt(atX, atY, el);
+        holdSideRef.current = side;
+        setHoldSide(side);
+        setHoldRate(side === "right" ? 2 : 0.5);
         setLockArmed(false);
         lockArmedRef.current = false;
         try { navigator.vibrate?.(25); } catch { /* ignore */ }
       }, 380) as unknown as number,
     };
     gesture.current = g;
+  };
+
+  /* —— 桌面端长按：鼠标按住画面 320ms 进入倍速，松开恢复；移动超过 8px 视为拖拽/点击，不触发 —— */
+  const onDeskDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    suppressClickRef.current = false;
+    if (!isDesktop || controlsLocked || !active || e.button !== 0) return;
+    const el = e.currentTarget;
+    const x = e.clientX;
+    const y = e.clientY;
+    const timer = window.setTimeout(() => {
+      const p = deskPress.current;
+      if (!p) return;
+      p.held = true;
+      suppressClickRef.current = true;   // 松手后紧跟的 click 不是「点击暂停」
+      const side = holdSideAt(p.x, p.y, el);
+      holdSideRef.current = side;
+      setHoldSide(side);
+      setHoldRate(side === "right" ? 2 : 0.5);
+    }, 320) as unknown as number;
+    deskPress.current = { x, y, timer, held: false };
+  };
+
+  const onDeskMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const p = deskPress.current;
+    if (!isDesktop || !p) return;
+    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) <= 8) return;
+    if (p.timer) { window.clearTimeout(p.timer); p.timer = null; }
+    if (p.held) {
+      p.held = false;
+      suppressClickRef.current = false;
+      holdSideRef.current = null;
+      setHoldRate(null);
+      setHoldSide(null);
+    }
+  };
+
+  const onDeskUp = () => {
+    if (!isDesktop) return;
+    const p = deskPress.current;
+    deskPress.current = null;
+    if (!p) return;
+    if (p.timer) window.clearTimeout(p.timer);
+    if (p.held) {
+      holdSideRef.current = null;
+      setHoldRate(null);
+      setHoldSide(null);
+    }
   };
 
   const onMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -746,8 +816,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const dx = rotated ? rawDy : rawDx;
     const dy = rotated ? -rawDx : rawDy;
 
-    /* 长按中：上滑 64px 进入「松开即锁定」 */
+    /* 长按中：只有右半（2x）可以上滑 64px 进入「松开即锁定」，左半是慢放，不做锁定 */
     if (g.mode === "hold") {
+      if (holdSideRef.current !== "right") return;
       const upDist = rotated ? (e.clientX - g.startX) : (g.startY - e.clientY);
       const armed = upDist > 64;
       if (armed !== lockArmedRef.current) {
@@ -788,8 +859,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
     if (g.mode === "hold") {
       holdRef.current = false;
-      setHoldSpeed(false);
-      if (!cancelled && lockArmedRef.current) {
+      const wasRight = holdSideRef.current === "right";
+      holdSideRef.current = null;
+      setHoldRate(null);
+      setHoldSide(null);
+      if (!cancelled && wasRight && lockArmedRef.current) {
         setSpeedLock(true);
         toast("已锁定 2.0x 倍速 · 点顶部标签解除", "info");
       }
@@ -1003,11 +1077,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     onTouchMove={onTouchMove}
                     onTouchEnd={onTouchEnd}
                     onTouchCancel={onTouchEnd}
-                    onPointerDown={onDown}
-                    onPointerMove={onMove}
-                    onPointerUp={(e) => onUp(e, false)}
-                    onPointerCancel={(e) => onUp(e, true)}
-                    onLostPointerCapture={(e) => onUp(e, true)}>
+                    onPointerDown={(e) => { onDown(e); onDeskDown(e); }}
+                    onPointerMove={(e) => { onMove(e); onDeskMove(e); }}
+                    onPointerUp={(e) => { onUp(e, false); onDeskUp(); }}
+                    onPointerCancel={(e) => { onUp(e, true); onDeskUp(); }}
+                    onPointerLeave={onDeskUp}
+                    onLostPointerCapture={(e) => { onUp(e, true); onDeskUp(); }}>
                     <VideoSurface
                       ref={videoRef}
                       src={playUrl}
@@ -1023,7 +1098,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       panX={zoom.x}
                       panY={zoom.y}
                       isGesturing={zoom.gesturing}
-                      onClick={() => { if (isDesktop) videoRef.current?.toggle(); }}
+                      onClick={() => {
+                        if (!isDesktop) return;
+                        /* 长按倍速松手后紧跟的 click 不能再当「点击暂停」 */
+                        if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+                        videoRef.current?.toggle();
+                      }}
                       onTime={onTimeTick}
                       onDuration={onDurationTick}
                       onSize={(w, h) => setVsize({ w, h })}
@@ -1075,25 +1155,33 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     </div>
                   )}
 
-                  {/* 移动端：倍速状态 / 锁定提示 */}
-                  {!isDesktop && (!clean || holdSpeed) && (holdSpeed || speedLock || rate !== 1) && (
+                  {/* 移动端：倍速状态 / 锁定提示（长按右半 2x、左半 0.5x） */}
+                  {!isDesktop && (!clean || holdRate !== null) && (holdRate !== null || speedLock || rate !== 1) && (
                     <button
                       onClick={() => {
                         if (speedLock) { setSpeedLock(false); toast("已解除倍速锁定", "info"); }
-                        else if (rate !== 1 && !holdSpeed) setRate(1);
+                        else if (rate !== 1 && holdRate === null) setRate(1);
                       }}
                       className={`absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-1.5 px-3.5 h-8 rounded-full backdrop-blur-md text-[12px] font-bold elev-2 pressable ${speedLock ? "bg-primary text-on-primary" : "hg-chip hg-gold"}`}
                       style={{ top: rotated || vpLandscape ? 14 : "calc(var(--sat, 0px) + 54px)" }}>
                       <IBoltF size={13} />
-                      {effRate}x {speedLock ? "已锁定 · 点按解除" : holdSpeed ? "倍速中 · 松开恢复" : "倍速"}
+                      {effRate}x {speedLock ? "已锁定 · 点按解除" : holdRate !== null ? `${holdSide === "left" ? "左半慢放" : "右半倍速"} · 松开恢复` : "倍速"}
                     </button>
                   )}
-                  {!isDesktop && holdSpeed && (
+                  {!isDesktop && holdRate === 2 && (
                     <div
                       className={`absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-4 h-10 rounded-xl backdrop-blur-md elev-2 transition-all duration-200 ${lockArmed ? "bg-primary text-on-primary scale-110" : "hg-chip-strong hg-ink-2"}`}
                       style={{ top: "38%" }}>
                       <ILockF size={16} />
                       <span className="text-[12.5px] font-bold">{lockArmed ? "松开锁定 2.0x" : "上滑到此锁定倍速"}</span>
+                    </div>
+                  )}
+                  {/* 桌面端：鼠标按住画面 320ms 进入倍速（右半 2x / 左半 0.5x） */}
+                  {isDesktop && holdRate !== null && (
+                    <div className="absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-1.5 px-3.5 h-8 rounded-full backdrop-blur-md text-[12px] font-bold elev-2 hg-chip hg-gold pointer-events-none"
+                      style={{ top: 18 }}>
+                      <IBoltF size={13} />
+                      {holdRate}x {holdSide === "left" ? "慢放中（左半）" : "倍速中（右半）"} · 松开恢复
                     </div>
                   )}
 

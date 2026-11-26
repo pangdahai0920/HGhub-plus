@@ -9,11 +9,15 @@ pub struct Session {
     // 旧版本没有 origin：不能推断其 token 属于哪个镜像，升级后必须重新登录。
     #[serde(default)]
     pub origin: String,
-    #[serde(default)]
+    /// 只留在内存和单独的 0600 文件里，绝不再写进 session.json（旧版本写在里面，bind 时会迁移出去）
+    #[serde(default, skip_serializing)]
     pub token: String,
     #[serde(default)]
     pub user: serde_json::Value,
 }
+
+/// token 与用户资料分文件存：session.json 可能被用户拿去反馈/备份，不该带着凭据
+const TOKEN_FILE: &str = "session.token";
 
 #[cfg(test)]
 mod tests {
@@ -59,13 +63,55 @@ mod tests {
         store.set("https://a.example", "t1".into(), json!({"id": 1}));
 
         let file = dir.join("session.json");
-        assert!(std::fs::read_to_string(&file).unwrap().contains("t1"));
+        assert!(std::fs::read_to_string(&file).unwrap().contains("a.example"));
         assert!(!dir.join("session.json.tmp").exists(), "临时文件必须被 rename 掉");
+        assert!(!dir.join("session.token.tmp").exists());
 
         // 重新绑定后能读回，说明落盘的是完整 JSON
         let again = SessionStore::new();
         again.bind(dir.clone());
         assert_eq!(again.token("https://a.example").as_deref(), Some("t1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_never_lands_in_the_plain_json() {
+        let dir = std::env::temp_dir().join(format!("hghub-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = SessionStore::new();
+        store.bind(dir.clone());
+        store.set("https://a.example", "secret-1".into(), json!({"id": 1}));
+
+        let json = std::fs::read_to_string(dir.join("session.json")).unwrap();
+        assert!(!json.contains("secret-1"), "session.json 里不该出现 token：{json}");
+        assert_eq!(std::fs::read_to_string(dir.join("session.token")).unwrap(), "secret-1");
+
+        // 退出登录把 token 文件删掉
+        store.clear();
+        assert!(!dir.join("session.token").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_token_inside_json_is_migrated_out() {
+        let dir = std::env::temp_dir().join(format!("hghub-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            r#"{"origin":"https://a.example","token":"legacy-1","user":{"id":1}}"#,
+        )
+        .unwrap();
+
+        let store = SessionStore::new();
+        store.bind(dir.clone());
+        assert_eq!(store.token("https://a.example").as_deref(), Some("legacy-1"));
+        assert!(!std::fs::read_to_string(dir.join("session.json")).unwrap().contains("legacy-1"));
+        assert_eq!(std::fs::read_to_string(dir.join("session.token")).unwrap(), "legacy-1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -85,14 +131,29 @@ impl SessionStore {
     }
 
     pub fn bind(&self, dir: PathBuf) {
-        let mut path = dir;
-        path.push("session.json");
+        let path = dir.join("session.json");
+        let token_path = path.with_file_name(TOKEN_FILE);
+
+        let mut sess = Session::default();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(sess) = serde_json::from_str::<Session>(&text) {
-                *self.current.lock().unwrap() = sess;
+            if let Ok(parsed) = serde_json::from_str::<Session>(&text) {
+                sess = parsed;
             }
         }
+        /* token 单独一个文件（Unix 下 0600）；旧版本写在 session.json 里，这里顺手迁移出去 */
+        let from_file = std::fs::read_to_string(&token_path)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let legacy = (!sess.token.is_empty()).then(|| sess.token.clone());
+        if let Some(token) = from_file.or_else(|| legacy.clone()) {
+            sess.token = token;
+        }
+        *self.current.lock().unwrap() = sess;
         *self.file.lock().unwrap() = Some(path);
+        if legacy.is_some() {
+            self.persist();   // 立刻重写 session.json，把明文 token 抹掉
+        }
     }
 
     pub fn token(&self, origin: &str) -> Option<String> {
@@ -133,8 +194,15 @@ impl SessionStore {
         let snapshot = self.current.lock().unwrap().clone();
         let path = self.file.lock().unwrap().clone();
         if let Some(path) = path {
+            /* Session 的 token 字段是 skip_serializing，写出去的 JSON 只有 origin + user */
             if let Ok(text) = serde_json::to_string_pretty(&snapshot) {
                 write_atomic(&path, text.as_bytes());
+            }
+            let token_path = path.with_file_name(TOKEN_FILE);
+            if snapshot.token.is_empty() {
+                let _ = std::fs::remove_file(&token_path);
+            } else {
+                write_atomic(&token_path, snapshot.token.as_bytes());
             }
         }
     }

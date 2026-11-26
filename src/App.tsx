@@ -17,6 +17,35 @@ import ResizeHandles from "./components/ResizeHandles";
 import { tracePlayback } from "./playbackDiagnostics";
 import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF, Logo } from "./icons";
 
+/* ============ 全局快捷键 ============ */
+/**
+ * 输入框里一律让路；数字键 1~4 只在「焦点不在按钮/链接/下拉」时切 tab。
+ * 之前是无条件生效：焦点停在选集按钮上按 2 会直接跳到搜索页，并把正在看的播放页
+ * 连同返回栈一起清掉。
+ */
+function globalKeyHandler(e: KeyboardEvent, ctx: {
+  loginOpen: boolean;
+  setLoginOpen: (b: boolean) => void;
+  stackLength: number;
+  pop: () => void;
+  setTab: (t: Tab) => void;
+}) {
+  const t = e.target as HTMLElement | null;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
+    if (e.key === "Escape") t.blur();
+    return;
+  }
+  if (ctx.loginOpen) { if (e.key === "Escape") ctx.setLoginOpen(false); return; }
+  if (e.key === "Escape") { if (ctx.stackLength) ctx.pop(); return; }
+  if (e.key === "/") { e.preventDefault(); ctx.setTab("search"); return; }
+  if (!["1", "2", "3", "4"].includes(e.key) || e.repeat) return;
+  const el = document.activeElement as HTMLElement | null;
+  if (el && el !== document.body) {
+    if (["BUTTON", "A", "SELECT", "SUMMARY"].includes(el.tagName) || el.isContentEditable) return;
+  }
+  ctx.setTab((["home", "search", "category", "profile"] as Tab[])[Number(e.key) - 1]);
+}
+
 /* ============ 底部标签栏（Android）—— 细瘦纯文字、低侵入 ============ */
 function TabBar() {
   const { tab, setTab, theme } = useStore();
@@ -99,19 +128,9 @@ function AppBody() {
 
   /* 全局键盘 */
   useEffect(() => {
-    const fn = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
-        if (e.key === "Escape") t.blur();
-        return;
-      }
-      if (loginOpen) { if (e.key === "Escape") setLoginOpen(false); return; }
-      if (e.key === "Escape") { if (stack.length) pop(); return; }
-      if (e.key === "/") { e.preventDefault(); setTab("search"); return; }
-      if (["1", "2", "3", "4"].includes(e.key) && !e.repeat) {
-        setTab((["home", "search", "category", "profile"] as Tab[])[Number(e.key) - 1]);
-      }
-    };
+    const fn = (e: KeyboardEvent) => globalKeyHandler(e, {
+      loginOpen, setLoginOpen, stackLength: stack.length, pop, setTab,
+    });
     window.addEventListener("keydown", fn);
     return () => window.removeEventListener("keydown", fn);
   }, [stack.length, pop, setTab, loginOpen, setLoginOpen]);
@@ -176,19 +195,9 @@ function ShellInner({ collapsed, theater }: { collapsed: boolean; theater: boole
   }, []);
 
   useEffect(() => {
-    const fn = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) {
-        if (e.key === "Escape") t.blur();
-        return;
-      }
-      if (loginOpen) { if (e.key === "Escape") setLoginOpen(false); return; }
-      if (e.key === "Escape") { if (stack.length) pop(); return; }
-      if (e.key === "/") { e.preventDefault(); setTab("search"); return; }
-      if (["1", "2", "3", "4"].includes(e.key) && !e.repeat) {
-        setTab((["home", "search", "category", "profile"] as Tab[])[Number(e.key) - 1]);
-      }
-    };
+    const fn = (e: KeyboardEvent) => globalKeyHandler(e, {
+      loginOpen, setLoginOpen, stackLength: stack.length, pop, setTab,
+    });
     window.addEventListener("keydown", fn);
     return () => window.removeEventListener("keydown", fn);
   }, [stack.length, pop, setTab, loginOpen, setLoginOpen]);
@@ -262,7 +271,12 @@ export default function App() {
   }, [platform]);
 
   useEffect(() => {
-    const prevent = (e: Event) => e.preventDefault();
+    /* 只拦页面主体的右键菜单（播放器体验），输入框/可编辑区域要留系统菜单，否则桌面端没法右键粘贴 */
+    const prevent = (e: Event) => {
+      const t = e.target as HTMLElement | null;
+      if (t && t.closest("input, textarea, [contenteditable='true'], [contenteditable='']")) return;
+      e.preventDefault();
+    };
     document.addEventListener("contextmenu", prevent);
     return () => document.removeEventListener("contextmenu", prevent);
   }, []);
