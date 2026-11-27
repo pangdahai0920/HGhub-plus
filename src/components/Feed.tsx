@@ -2,11 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, isMobile } from "../api";
 import type { Detail, Episode, Post } from "../types";
-import { useStore } from "../store";
+import { usePlayStore } from "../store";
 import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
 import PlaybackLock from "./PlaybackLock";
+import { ClockText, createClock } from "../clock";
 import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
 import { setBackHandler } from "../back";
 import {
@@ -71,14 +72,19 @@ function findSlide(deck: Slide[], s: Slide): number {
 }
 
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
-  const store = useStore();
+  /* 用播放态快照而不是 useStore()：观看记录每 5 秒写入一次，主 context 会整体换新
+     引用，导致上千行的播放页跟着重渲染。这份快照不含 history，写入不影响它。 */
+  const store = usePlayStore();
   const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
   const isDesktop = !isMobile;
 
   const boxRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<VideoHandle>(null);
 
-  const [time, setTime] = useState(0);
+  /* 播放进度不进 React state：timeupdate 约 4Hz，写进 state 会让整个 deck 重渲染。
+     改成订阅式时钟，只有进度条/时码这些真正订阅的节点更新。 */
+  const clock = useMemo(() => createClock(0), []);
+  const time = clock.read();
   const [duration, setDuration] = useState(0);
   const [vsize, setVsize] = useState({ w: 0, h: 0 });
   const [buffered, setBuffered] = useState(0);
@@ -235,7 +241,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const onTimeTick = (t: number) => {
     liveRef.current = { id: curId, ep: curEp, dur: duration, t };
     if (!barScrub.current && gesture.current?.mode !== "scrub") {
-      setTime(t);
+      clock.write(t);
     }
     const now = Date.now();
     if (duration > 0 && now - lastSaveRef.current > 5000) {
@@ -252,7 +258,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (r && r.key === playKey && r.t > 1 && (!d || r.t < d - 3)) {
       resumeRef.current = null;
       videoRef.current?.seek(r.t, "history_resume");
-      setTime(r.t);
+      clock.write(r.t);
     }
   };
 
@@ -572,7 +578,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
-    setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
+    clock.reset(); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
@@ -877,7 +883,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       scrubTarget.current = null;
       if (!cancelled && target != null) {
         setErr("");
-        setTime(target);
+        clock.write(target);
         videoRef.current?.seek(target, "mobile_gesture");
       }
       if (g.playing && active) videoRef.current?.play();
@@ -971,7 +977,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (pct != null && duration > 0) {
       const target = Math.max(0, Math.min(duration - 0.15, pct * duration));
       setErr("");
-      setTime(target);
+      clock.write(target);
       videoRef.current?.trace("seek.input.up", { input: "mobile_bar", target });
       videoRef.current?.seek(target, "mobile_bar");
     }
@@ -1227,7 +1233,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           className="hg-chip shrink-0 w-9 h-9 rounded-full flex items-center justify-center pressable">
                           {paused ? <IPlayF size={18} /> : <IPauseF size={17} />}
                         </button>
-                        <span className="shrink-0 text-[11.5px] font-semibold hg-ink-2 tabular-nums">{fmtTime(time)}</span>
+                        <ClockText clock={clock} className="shrink-0 text-[11.5px] font-semibold hg-ink-2 tabular-nums" />
                         <button
                           onClick={() => {
                             if (speedLock) { setSpeedLock(false); return; }
@@ -1493,7 +1499,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           nextDisabled={index >= deck.length - 1}
           nextTitle={deck[index + 1]?.id === curId ? "下一集 E" : "下一部 ↓"}
           onToggle={() => videoRef.current?.toggle()}
-          onSeek={(t, source) => { videoRef.current?.seek(t, source); setTime(t); }}
+          onSeek={(t, source) => { videoRef.current?.seek(t, source); clock.write(t); }}
           onSeekInteraction={(phase, input, target, pointerTarget) => videoRef.current?.trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget })}
           onRate={(r) => { setRate(r); videoRef.current?.rate(r); }}
           onMute={() => setMuted((m) => !m)}

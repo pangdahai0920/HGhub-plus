@@ -174,6 +174,24 @@ type Store = {
 
 const Ctx = createContext<Store>(null as unknown as Store);
 export const useStore = () => useContext(Ctx);
+
+/**
+ * 播放态快照：只给播放页/Feed 用。
+ *
+ * 为什么不直接用 `useStore()`：主 context 的 value 依赖整个持久化对象 `p`，
+ * 而播放中每 5 秒 `addHistory` 都会更新 `p.history` → 所有 `useStore()` 消费者
+ * 重渲染一次（含上千行的播放页与整个 deck）。这里单独抽一份**不含 history**
+ * 的快照，`addHistory` 不会让它变化，播放页于是不再被观看记录写入打断。
+ */
+type PlayStore = Pick<
+  Store,
+  "isLiked" | "isFav" | "toggleLikeLocal" | "toggleFavLocal" | "toggleFollowLocal"
+  | "muted" | "setMuted" | "volume" | "setVolume" | "toast" | "addHistory" | "user" | "setLoginOpen"
+  | "theater" | "setTheater" | "fs" | "setFs" | "clean" | "setClean"
+  | "follows" | "setTab" | "setUser"
+>;
+const PlayCtx = createContext<PlayStore>(null as unknown as PlayStore);
+export const usePlayStore = () => useContext(PlayCtx);
 let seq = 0;
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
@@ -393,14 +411,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setP((s) => ({ ...s, volume, muted: volume === 0 }));
   }, []);
 
+  const isLiked = useCallback((id: number) => p.likes.includes(id), [p.likes]);
+  const isFav = useCallback((id: number) => p.favs.includes(id), [p.favs]);
+
   const value = useMemo<Store>(() => ({
     platform: envPlatform,
     theme, setTheme: setThemeState,
     tab, setTab, stack, push, pop,
     user, setUser, loginOpen, setLoginOpen, logout,
     likes: p.likes, favs: p.favs, history: p.history, follows: p.follows,
-    isLiked: (id) => p.likes.includes(id),
-    isFav: (id) => p.favs.includes(id),
+    isLiked,
+    isFav,
     toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
     muted: p.muted, setMuted, volume: p.volume, setVolume,
     theater, setTheater, fs, setFs, clean, setClean,
@@ -413,5 +434,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setMuted, setMuteOnStartup, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast, theater, setTheater, fs, setFs, clean, setClean]);
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  /* 播放态快照：刻意不含 history —— addHistory 更新历史时它保持引用不变，
+     播放页因此不会被观看记录写入触发重渲染。 */
+  const playValue = useMemo<PlayStore>(() => ({
+    isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal,
+    muted: p.muted, setMuted, volume: p.volume, setVolume, toast, addHistory, user, setLoginOpen,
+    theater, setTheater, fs, setFs, clean, setClean, follows: p.follows, setTab, setUser,
+  }), [isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal,
+    p.muted, p.volume, p.follows, setMuted, setVolume, toast, addHistory, user, setLoginOpen,
+    theater, setTheater, fs, setFs, clean, setClean, setTab, setUser]);
+
+  return (
+    <Ctx.Provider value={value}>
+      <PlayCtx.Provider value={playValue}>{children}</PlayCtx.Provider>
+    </Ctx.Provider>
+  );
 }
