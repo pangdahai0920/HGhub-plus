@@ -57,6 +57,16 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
 
+# iOS 安全区内缩修复（见 src/ios_insets.rs）：
+# objc2 / objc2-ui-kit 已是 tao/wry 的间接依赖，这里只为把它们提到可直接 use。
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-ui-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "UIGeometry",
+  "UIScrollView",
+] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

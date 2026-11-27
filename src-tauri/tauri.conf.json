@@ -21,8 +21,9 @@
         "decorations": false,
         "transparent": false,
         "resizable": true,
-        "center": true
-      }
+        "center": true,
+        "backgroundColor": "#1a1a1a"
+        }
     ],
     "security": {
       "csp": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: hg: http://hg.localhost https://hg.localhost; media-src 'self' blob: hg: http://hg.localhost https://hg.localhost; connect-src ipc: http://ipc.localhost https://ipc.localhost hg: http://hg.localhost https://hg.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'",

@@ -1,4 +1,6 @@
 mod api;
+#[cfg(target_os = "ios")]
+mod ios_insets;
 mod lines;
 mod logging;
 #[cfg(target_os = "macos")]
@@ -64,6 +66,12 @@ pub fn run() {
             // macOS 主窗口在此创建：先按系统红绿灯尺寸算出居中位置（见 macos_titlebar.rs）
             #[cfg(target_os = "macos")]
             macos_titlebar::create_main_window(app)?;
+            // iOS：关掉 WKWebView 内层 scrollView 的自动安全区内缩，
+            // 否则底部（Home 指示条那条）会露一条白带，改 CSS 无效（见 ios_insets.rs）
+            #[cfg(target_os = "ios")]
+            if let Some(main) = app.get_webview("main") {
+                ios_insets::disable_auto_inset(&main);
+            }
             Ok(())
         })
         .plugin(
