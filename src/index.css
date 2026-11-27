@@ -91,6 +91,15 @@ html.theme-light {
 }
 
 html, body, #root { height: 100%; overflow: hidden; overscroll-behavior: none; }
+/* iOS 上 `height: 100%` 只到布局视口，不含底部安全区（Home 指示条那一条），
+   结果屏幕最底部露出一条系统白边。改用 fixed + inset:0 以视口为参考系，
+   铺到物理屏幕最底。见 README 里「底部留白」一节。 */
+#root {
+  position: fixed;
+  inset: 0;
+  height: auto;
+  background: var(--p-canvas);
+}
 body {
   margin: 0;
   background: var(--p-canvas);
