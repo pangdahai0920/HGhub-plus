@@ -14,11 +14,13 @@
 //! `msg_send!` 动态发送，不额外引依赖（objc2 / objc2-ui-kit 已是 tao/wry 的间接依赖）。
 
 #[cfg(target_os = "ios")]
-pub fn disable_auto_inset(webview: &tauri::Webview) {
+pub fn disable_auto_inset(window: &tauri::WebviewWindow) {
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
     use objc2_ui_kit::{UIScrollView, UIScrollViewContentInsetAdjustmentBehavior, UIEdgeInsets};
 
+    // WebviewWindow 实现了 AsRef<Webview>，拿到底层 Webview 才能调 with_webview。
+    let webview: &tauri::Webview = window.as_ref();
     webview.with_webview(|platform| {
         let raw = platform.inner();
         if raw.is_null() {

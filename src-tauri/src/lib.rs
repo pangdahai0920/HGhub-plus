@@ -68,9 +68,11 @@ pub fn run() {
             macos_titlebar::create_main_window(app)?;
             // iOS：关掉 WKWebView 内层 scrollView 的自动安全区内缩，
             // 否则底部（Home 指示条那条）会露一条白带，改 CSS 无效（见 ios_insets.rs）
+            // 注意：`Manager::get_webview` 被 tauri 的 unstable feature 门控，
+            // 这里用稳定的 `webview_windows()` 按 label 取。
             #[cfg(target_os = "ios")]
-            if let Some(main) = app.get_webview("main") {
-                ios_insets::disable_auto_inset(&main);
+            if let Some(main) = app.webview_windows().get("main") {
+                ios_insets::disable_auto_inset(main);
             }
             Ok(())
         })
